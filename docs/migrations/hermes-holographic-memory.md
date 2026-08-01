@@ -1,22 +1,25 @@
-# Hermes Holographic Memory Migration Plan
+# Hermes Persona And Holographic Memory Migration Plan
 
 ## Purpose
 
-Migrate a user's Hermes Holographic memory into Astra Agent without treating Hermes internals as
-the new system's source of truth. Preserve the useful facts, trust signals, provenance, and review
-history while rebuilding retrieval in Astra's MariaDB and Qdrant architecture.
+Migrate a user's Hermes persona and Holographic memory into Astra Agent without treating Hermes
+internals as the new system's source of truth. Preserve the useful facts, trust signals,
+provenance, and behavioral continuity while rebuilding retrieval in Astra's MariaDB and Qdrant
+architecture.
 
 This is a post-MVP migration feature. It must not be required to run Astra Agent.
 
 ## Scope
 
-The migration covers a selected Hermes profile's Holographic SQLite fact store and associated
-persona/memory files where the user explicitly elects to import them.
+The migration covers a selected Hermes profile's Holographic SQLite fact store, `SOUL.md`,
+`USER.md`, and `MEMORY.md` where the user explicitly elects to import them. Persona activation and
+fact activation are one migration wave: Astra must not begin normal conversation with imported
+facts until an authored persona profile has been reviewed and activated.
 
 It does not automatically import:
 
 - API keys, credentials, messaging tokens, or `.env` files.
-- Skills, tools, MCP configuration, integrations, cron jobs, or approval allowlists.
+- Tools, MCP configuration, integrations, cron jobs, or approval allowlists.
 - Hermes internal indexes, cached context, or implementation-specific HRR vectors.
 - Project instruction files such as `AGENTS.md`.
 
@@ -29,6 +32,7 @@ It does not automatically import:
 - Rebuild embeddings in Qdrant; do not copy Hermes HRR or retrieval indexes.
 - Keep MariaDB as Astra's authorization and canonical-memory source of truth.
 - Make every import record tenant-scoped, auditable, inspectable, and reversible.
+- Do not activate a fact-only migration as a live conversational persona.
 
 ## Source Discovery
 
@@ -63,6 +67,11 @@ Before any import, the command must:
 | Contradiction/update links | replacement/contradiction relationship | Preserve links when both records are imported. |
 | Creation/update time | source timestamps | Preserve as source metadata rather than overwriting Astra audit time. |
 | HRR vectors and FTS indexes | not imported | Recreate retrieval indexes from canonical imported records. |
+| `SOUL.md` / system persona | draft `PersonaProfile.authored_core` | Convert to a versioned draft; require explicit review before activation. |
+| `USER.md` | preference records | Import as promoted low-risk preferences or review candidates. |
+| `MEMORY.md` | facts, projects, procedures | Classify by type; separate environment notes from user facts. |
+| Skills | procedure candidates | Preserve selected skill content for review; never automatically activate tools or executable instructions. |
+| Session history | raw conversation archive | Import only with consent; extract candidate memories asynchronously after activation. |
 
 Every imported record must include:
 
@@ -75,6 +84,29 @@ source_external_id
 import_batch_id
 source_created_at / source_updated_at, when available
 ```
+
+## Identity And Activation Gate
+
+`SOUL.md` and any profile-level persona/system instructions must become a draft, versioned
+`PersonaProfile.authored_core`. The review must make the following visible and editable:
+
+- name and identity
+- values and behavioral boundaries
+- communication tone and emotional range
+- initiative and autonomy expectations
+- disagreement and correction style
+- immediate-stop behavior and other hard user controls
+
+The imported persona draft is never silently activated. The user must explicitly approve it.
+
+A migration batch is not live until both conditions are true:
+
+1. The reviewed persona version is active for the target tenant.
+2. The approved fact and preference records in the matching migration batch are promoted.
+
+Before these conditions are true, the TUI must present migration preview/review state only. Normal
+conversation, autonomous action, and worker delegation remain unavailable. This prevents a
+fact-only agent from presenting itself as the migrated persona.
 
 ## Classification And Review
 
@@ -89,17 +121,47 @@ Import classification must use deterministic rules first and an optional local m
 
 The user must be able to promote, reject, edit, delete, or roll back every imported batch.
 
+## Import Waves
+
+### Wave 1: Identity And Facts — Required Together
+
+1. Import Holographic facts into staging.
+2. Convert `SOUL.md` and profile persona instructions into a draft `PersonaProfile`.
+3. Present persona and fact review to the user.
+4. On approval, atomically activate the persona version and promote the approved migration batch.
+5. Enqueue Qdrant indexing for promoted records.
+
+### Wave 2: Preferences And Conventions
+
+Import `USER.md` and `MEMORY.md` into structured preference, fact, project, and procedure
+records. Promote only explicit, low-risk, high-confidence content; stage all other records for
+review.
+
+### Wave 3: Conversation History — Opt In
+
+Import selected session history as raw, tenant-scoped conversation events only after explicit
+consent. Use asynchronous extraction to create reviewable memory candidates; do not turn every
+past statement into durable memory.
+
+### Wave 4: Procedural Knowledge — Quarantined By Default
+
+Import user-selected skills as procedure candidates with source provenance. They may inform future
+procedure design, but must not receive capabilities, execute, or alter policy until separately
+reviewed and activated.
+
 ## Import Workflow
 
-1. Run a dry run and present counts and potential risks.
+1. Run a dry run and present persona, fact, preference, history, and skill counts with potential
+   risks.
 2. Create the read-only source backup and record its fingerprint.
 3. Normalize supported source records into an import staging table.
 4. Deduplicate against existing Astra memories using source identity and normalized content.
 5. Classify each record as promoted, candidate, rejected, or skipped.
-6. Create canonical MariaDB memory records and append audit events.
-7. Enqueue Qdrant embedding/index jobs for promoted records.
-8. Display completion and review requirements in the TUI.
-9. Validate recall against a user-selected sample before retiring Hermes.
+6. Create staged canonical MariaDB records and append audit events.
+7. Require persona review and the atomic activation gate before enabling normal conversation.
+8. Enqueue Qdrant embedding/index jobs for promoted records.
+9. Display completion and review requirements in the TUI.
+10. Validate recall and persona behavior against a user-selected sample before retiring Hermes.
 
 The import must be resumable and idempotent by tenant, source database fingerprint, and source
 external ID. Partial failure must not create duplicate memories or orphaned Qdrant vectors.
@@ -109,6 +171,8 @@ external ID. Partial failure must not create duplicate memories or orphaned Qdra
 The migration is accepted only when:
 
 - Imported records are visible only to the target tenant.
+- The active persona is an explicitly approved, versioned import and no fact-only batch can enable
+  normal conversation.
 - Every imported record retains provenance and can be traced to its source.
 - Qdrant contains only records authorized by MariaDB.
 - Re-running the same import creates no duplicates.
@@ -117,14 +181,3 @@ The migration is accepted only when:
 
 Keep the original Hermes database backup until the user confirms that Astra's recall and persona
 behavior are satisfactory.
-
-## Future Extension: Full Hermes Profile Migration
-
-After Holographic memory migration is stable, a separate importer may offer selected migration of
-`SOUL.md`, `USER.md`, `MEMORY.md`, and conversation history. These sources must follow the same
-review and provenance model:
-
-- Convert `SOUL.md` into a draft, versioned authored persona profile that requires approval.
-- Convert `USER.md` into high-confidence preference candidates or promoted preferences.
-- Convert `MEMORY.md` into classified facts, project context, and procedures.
-- Import sessions as raw, consented conversation history; extract memory candidates asynchronously.
