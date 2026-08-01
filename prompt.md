@@ -111,6 +111,16 @@ After asynchronous reliability is solid:
 6. Expand read-only specialist ARAs only when their capability and deliverable contracts are
    explicit and tested.
 
+## Post-MVP: Hermes Holographic Memory Migration
+
+After the persona, memory-job, and retrieval foundations are stable, implement the reviewed
+Holographic-memory migration plan in
+[`docs/migrations/hermes-holographic-memory.md`](docs/migrations/hermes-holographic-memory.md).
+The importer must be dry-run-first, read-only against Hermes, tenant-scoped, auditable,
+idempotent, and reversible. It imports canonical facts and trust/provenance metadata, then
+rebuilds Astra retrieval indexes; it must not copy Hermes HRR vectors or automatically modify the
+authored persona core.
+
 ## Production hardening track
 
 Keep local development usable while adding:
