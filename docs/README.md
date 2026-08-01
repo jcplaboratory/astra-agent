@@ -14,6 +14,9 @@ work.
   meaningful differentiation.
 - [Astra Agent Compared With Hermes Agent](astra-vs-hermes.md): a sourced comparison of their
   core architecture, execution boundaries, context strategy, and especially memory governance.
+- [Coordinator Local Tool Execution](coordinator-tool-execution.md): planned — making the
+  coordinator a first-class tool executor with a model-driven loop, shared capability model,
+  and unified local/ARA dispatch.
 
 ## Status Legend
 
