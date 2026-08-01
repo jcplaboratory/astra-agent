@@ -1,0 +1,44 @@
+[project]
+name = "astra-agent-workspace"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "pytest-asyncio>=0.26",
+  "ruff>=0.11",
+]
+
+[tool.uv.workspace]
+members = [
+  "apps/astra-agent-api",
+  "apps/astra-tui",
+  "apps/ara",
+  "packages/domain",
+  "packages/protocol",
+  "packages/runtime",
+  "packages/memory",
+  "packages/policy",
+  "packages/model-providers",
+  "packages/ara-sdk",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["astra_domain", "astra_protocol", "astra_policy", "astra_runtime", "astra_memory", "astra_model_providers", "astra_agent"]
+plugins = ["pydantic.mypy"]

@@ -1,74 +1,163 @@
-You are implementing the MVP for a hosted, distributed agent platform in `/Users/cedric/Repos/depa`.
+# Astra Agent Continuation Brief
+
+You are continuing implementation of **Astra Agent**, a hosted Distributed Enriched-Persona
+Agent (**D.E.P.A.**), in `/Users/cedric/Repos/depa`.
 
 Read and follow:
 
 - `/Users/cedric/Repos/depa/AGENTS.md`
+- `/Users/cedric/Repos/depa/README.md`
 - `/Users/cedric/Repos/depa/sources/distributed-enriched-persona-agent-mvp-spec.md`
 
-Do not modify anything under `/Users/cedric/Repos/depa/sources/`.
+Treat everything under `/Users/cedric/Repos/depa/sources/` as immutable reference material.
+Do not edit, rename, move, or delete it.
 
-## Product goal
+## Product identity
 
-Build a hosted coordinator for an enriched-persona agent. A TUI user can converse with the agent; the coordinator compiles compact persona/memory context, delegates bounded work to mTLS-authenticated remote workers, and records auditable events.
+- Product: **Astra Agent**.
+- Architecture: Distributed Enriched-Persona Agent (**D.E.P.A.**).
+- Remote execution nodes: **Astra Remote Agents (ARA)**.
+- Python namespaces use `astra_*`; the ARA SDK uses `astra_ara_sdk`.
+- Commands are `astra-agent`, `astra-tui`, and `ara`.
+- Configuration uses `ASTRA_*` and `ASTRA_ARA_*`.
+- Transport headers use `X-Astra-*`.
+- ARA routes use `/api/v1/aras/*`.
+- Do not restore legacy Depa/worker compatibility aliases.
 
-## Fixed MVP decisions
+## Fixed architecture
 
-- Python 3.12+ monorepo.
-- FastAPI for the hosted coordinator and worker control plane.
-- Textual/Rich for the TUI.
-- MariaDB is the authoritative database.
-- Qdrant is used only for vector retrieval.
-- S3-compatible object storage is for artifacts.
-- OpenRouter is the sole main-model provider in v1, behind an adapter.
-- A swappable local-model adapter handles memory extraction, ranking, and context compilation.
-- Workers authenticate through mTLS and pull bounded task leases from the coordinator.
-- Default-deny capability policy; no implicit write, command, network, credential, or external-message access.
-- No recursive worker delegation.
-- No PostgreSQL, pgvector, plugin marketplace, multi-channel integrations, browser automation, or scheduling in this MVP.
+- Python 3.12+ `uv` monorepo.
+- FastAPI Astra Agent control plane.
+- Textual/Rich TUI.
+- MariaDB is authoritative for state and authorization.
+- Qdrant ranks only records already authorized by MariaDB.
+- S3-compatible storage holds artifacts.
+- OpenRouter is the sole v1 main-model provider.
+- A swappable local model handles memory extraction and classification.
+- ARAs authenticate with mTLS and pull bounded leases.
+- Capabilities are explicit and default-deny.
+- No recursive ARA delegation.
+- No PostgreSQL, pgvector, browser automation, scheduling, plugin marketplace, or extra user
+  channels in this MVP.
 
-## First implementation milestone
+## Current implemented baseline
 
-Create a runnable, well-structured foundation—not the entire product.
+The following is complete and tested. Do not rebuild it from scratch:
 
-Implement:
+- Typed tenant-owned domain, protocol, policy, runtime, memory, model, and ARA SDK packages.
+- In-memory and transactional MariaDB persistence with Alembic migrations.
+- OIDC user authentication and trusted-ingress mTLS ARA identity.
+- Versioned FastAPI routes for conversations, tasks, ARAs, approvals, audit, memory, and artifacts.
+- Multi-turn TUI conversations with automatic local Keycloak login for development.
+- OpenRouter chat using `deepseek/deepseek-v4-pro` through an adapter.
+- Bounded persona/history/memory context compilation.
+- Structured memory extraction, candidates, promotion/rejection, contradiction replacement,
+  provenance, deletion, and MariaDB-authorized Qdrant ranking.
+- Atomic ARA registration, leasing, renewal, progress, approval, completion, cancellation, lease
+  expiry, and task result persistence.
+- A real read-only repository ARA that returns file and line evidence.
+- Deterministic planning for explicit repository inspection requests and synthesis of ARA results.
+- Presigned S3/MinIO uploads with object scope, size, media type, and SHA-256 verification.
+- Secure local Compose stack with MariaDB, Qdrant, MinIO, Keycloak, Astra Agent, and nginx mTLS.
+- Optional Ollama profile for local memory extraction.
+- Fresh local infrastructure uses database `astra_agent`, collection `astra_memories`, bucket
+  `astra-artifacts`, and table `remote_agents`.
 
-1. Python workspace/package configuration and developer setup.
-2. Shared typed domain models for tenants, tasks, leases, workers, capabilities, approvals, events, persona, and memory records.
-3. A FastAPI coordinator with health checks and versioned API routing.
-4. Worker registration and task-lease endpoints with an authentication abstraction prepared for mTLS.
-5. An append-only audit-event interface with a MariaDB-backed implementation boundary.
-6. A simple in-memory implementation for local development so the API can run before infrastructure is configured.
-7. A Textual TUI that connects to the coordinator health endpoint and displays a minimal conversation/task screen.
-8. Configuration through typed environment settings, with safe defaults and no secrets committed.
-9. Focused tests for domain validation, task leasing, and policy defaults.
-10. Clear README instructions for local setup and the next development milestone.
+The current full test suite passes. Re-run it before and after substantial work rather than
+assuming this statement remains true.
 
-Use these root directories:
+## Next milestone: reliable asynchronous operations
 
-```text
-apps/
-  coordinator-api/
-  tui/
-  worker/
-packages/
-  domain/
-  protocol/
-  runtime/
-  memory/
-  policy/
-  model-providers/
-  worker-sdk/
+Implement this milestone before broadening product scope.
+
+1. Add a durable background-job model and MariaDB queue for memory extraction, embedding/index
+   synchronization, and retryable maintenance work.
+2. Persist job attempts, state, next-attempt time, bounded exponential backoff, terminal failure,
+   tenant ownership, source record, and structured error details.
+3. Ensure raw conversations remain successful when local-model or Qdrant processing fails.
+4. Add an Astra Agent background runner that safely claims jobs with transactional locking and
+   supports graceful shutdown.
+5. Make memory extraction idempotent by source message and make Qdrant synchronization
+   recoverable after partial failure.
+6. Add authenticated, tenant-scoped artifact metadata and download endpoints using short-lived
+   presigned GET URLs.
+7. Authorize every artifact through MariaDB before generating a URL; never trust an object key
+   supplied by the caller and never use S3 existence as authorization.
+8. Add artifact deletion/retention behavior with append-only audit events.
+9. Improve ARA resilience: heartbeat/offline status, lease renewal during long execution,
+   cancellation observation, bounded retries, and structured failure reporting.
+10. Surface background failures, ARA health, and artifact downloads in the TUI without blocking
+    conversation input.
+
+## Following milestone: richer orchestration
+
+After asynchronous reliability is solid:
+
+1. Replace keyword-only delegation with a typed planner decision contract behind the main-model
+   adapter.
+2. Validate every plan against policy before creating tasks.
+3. Select ARAs by tenant, capability, health, trust, and availability.
+4. Support bounded parallel sibling tasks while preserving the no-recursive-delegation rule.
+5. Synthesize multiple structured ARA results with explicit provenance and partial-failure
+   handling.
+6. Expand read-only specialist ARAs only when their capability and deliverable contracts are
+   explicit and tested.
+
+## Production hardening track
+
+Keep local development usable while adding:
+
+- Structured logs with request, tenant, conversation, task, lease, ARA, and job correlation IDs.
+- Metrics and readiness checks for MariaDB, Qdrant, S3, OIDC/JWKS, model providers, and queue lag.
+- Rate limits, request-size limits, timeouts, and model/token/cost accounting.
+- Secret-manager integration and documented key/certificate rotation.
+- Managed PKI and revocation behavior for ARA certificates.
+- Backups, restore verification, migration rollback guidance, and retention policies.
+- Network policy preventing direct access around the mTLS ingress.
+- HTTPS for user-facing OIDC and Astra Agent traffic.
+
+The bundled Keycloak credentials, generated CA, and development secrets are local-demo assets,
+not production security controls.
+
+## Engineering constraints
+
+- Inspect existing contracts and tests before editing.
+- Make the smallest correct change and preserve established package boundaries.
+- Keep modules typed and use explicit protocols for persistence, models, vectors, artifacts,
+  background jobs, and ARA transport.
+- `tenant_id` is mandatory on durable user-owned data, jobs, task messages, and artifacts.
+- MariaDB is always the authorization source of truth.
+- Qdrant payload filters must include tenant and visibility metadata, but are defense in depth only.
+- Persist raw user input before optional model, memory, vector, or ARA work.
+- Do not expose secrets in source, logs, tests, documentation, or final responses.
+- Do not add compatibility shims for the previous project name.
+- Do not weaken TLS/OIDC verification to make local tests pass.
+- Treat writes, commands, network, credentials, and external messaging as denied or approval-gated.
+- Add adversarial tenant-isolation, concurrency, retry, and partial-failure tests for new behavior.
+
+## Verification
+
+At minimum run:
+
+```bash
+uv sync --all-packages
+uv run ruff format --check .
+uv run ruff check .
+uv run mypy
+uv run pytest -q
 ```
 
-## Engineering requirements
+For infrastructure changes, also run the relevant live MariaDB, Qdrant, MinIO, OIDC, mTLS, ARA,
+and TUI smoke tests described in `README.md`. Report precisely what passed, what remains optional,
+and any production-only work that cannot be validated locally.
 
-- Start by inspecting the repository and presenting a concise implementation plan.
-- Preserve the specification’s boundaries; do not add unrelated frameworks or integrations.
-- Keep modules small and typed.
-- Prefer explicit interfaces/protocols around persistence, models, vectors, artifacts, and worker transport.
-- Treat `tenant_id` as mandatory on all durable, user-owned data and task messages.
-- Design Qdrant filters to include tenant and visibility metadata, but never treat Qdrant filtering as the authorization source of truth.
-- Do not pretend mTLS or MariaDB integrations are complete if they are only scaffolded; label placeholders clearly.
-- Run the relevant tests and report what passes, what remains stubbed, and the recommended next milestone.
+## Definition of done for the next milestone
 
-Begin with the foundation milestone above. Do not attempt to implement full memory intelligence, OpenRouter chat, or actual remote execution until the shared contracts, task lifecycle, policy boundary, and TUI-to-coordinator path are solid.
+- Conversation latency does not depend on memory extraction or Qdrant availability.
+- Failed memory/vector work is durable, visible, retryable, and idempotent.
+- Restarting Astra Agent does not lose or duplicate queued work.
+- Artifact downloads are short-lived and authorized through MariaDB.
+- ARAs renew leases, report failures, observe cancellation, and become offline when heartbeats stop.
+- The TUI exposes task/job/ARA failure state without disabling chat.
+- In-memory, MariaDB, API, concurrency, tenant-isolation, and live-service tests pass.
+- README setup and operational instructions match the tested commands.

@@ -1,0 +1,58 @@
+name: astra-agent
+
+services:
+  mariadb:
+    image: mariadb:11.8
+    environment:
+      MARIADB_DATABASE: astra_agent
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?set MARIADB_ROOT_PASSWORD}
+    ports:
+      - "3306:3306"
+    volumes:
+      - astra-mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-astra-development}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-development-only-change-me}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - astra-minio:/data
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - astra-qdrant:/qdrant/storage
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - astra-ollama:/root/.ollama
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    depends_on: [ollama]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until ollama list >/dev/null 2>&1; do sleep 1; done;
+        ollama pull ${ASTRA_LOCAL_MODEL_NAME:-qwen2.5:3b}
+
+volumes:
+  astra-mariadb:
+  astra-minio:
+  astra-qdrant:
+  astra-ollama:

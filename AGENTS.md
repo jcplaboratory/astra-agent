@@ -1,6 +1,7 @@
 # ChatGPT project context
 
-This directory is a local mirror of the ChatGPT project “depa”.
+This directory is a local mirror of the Astra Agent project. Astra Agent remains a Distributed
+Enriched-Persona Agent (D.E.P.A.).
 
 - Treat every file under `sources/` as read-only reference material.
 - Do not edit, rename, move, or delete synced project files.

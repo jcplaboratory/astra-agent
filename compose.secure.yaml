@@ -1,0 +1,61 @@
+services:
+  astra-agent:
+    build: .
+    command: ["/bin/sh", "-c", "alembic upgrade head && exec uvicorn astra_agent.app:create_app --factory --host 0.0.0.0 --port 8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      ASTRA_PERSISTENCE_BACKEND: mariadb
+      ASTRA_DATABASE_URL: mysql+aiomysql://root:${MARIADB_ROOT_PASSWORD}@mariadb:3306/astra_agent?charset=utf8mb4
+      ASTRA_AUTH_BACKEND: mtls
+      ASTRA_TRUSTED_PROXY_SECRET: ${ASTRA_TRUSTED_PROXY_SECRET:?set ASTRA_TRUSTED_PROXY_SECRET}
+      ASTRA_USER_AUTH_BACKEND: oidc
+      ASTRA_OIDC_ISSUER: http://localhost:8080/realms/astra-agent
+      ASTRA_OIDC_AUDIENCE: astra-tui
+      ASTRA_OIDC_JWKS_URL: http://keycloak:8080/realms/astra-agent/protocol/openid-connect/certs
+      ASTRA_MODEL_BACKEND: ${ASTRA_MODEL_BACKEND:-development}
+      ASTRA_OPENROUTER_API_KEY: ${ASTRA_OPENROUTER_API_KEY:-}
+      ASTRA_OPENROUTER_MODEL: ${ASTRA_OPENROUTER_MODEL:-deepseek/deepseek-v4-pro}
+      ASTRA_MEMORY_BACKEND: qdrant
+      ASTRA_QDRANT_URL: http://qdrant:6333
+      ASTRA_QDRANT_COLLECTION: astra_memories
+      ASTRA_MEMORY_EXTRACTOR_BACKEND: ${ASTRA_MEMORY_EXTRACTOR_BACKEND:-deterministic}
+      ASTRA_LOCAL_MODEL_URL: http://ollama:11434/v1
+      ASTRA_LOCAL_MODEL_NAME: ${ASTRA_LOCAL_MODEL_NAME:-qwen2.5:3b}
+      ASTRA_ARTIFACT_BUCKET: astra-artifacts
+      ASTRA_ARTIFACT_ENDPOINT_URL: http://minio:9000
+      ASTRA_ARTIFACT_ACCESS_KEY: ${MINIO_ROOT_USER:-astra-development}
+      ASTRA_ARTIFACT_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-development-only-change-me}
+    depends_on:
+      mariadb:
+        condition: service_healthy
+  ara-ingress:
+    image: nginx:1.27-alpine
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./deploy/nginx-mtls.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./deploy/tls:/etc/nginx/tls:ro
+    environment:
+      ASTRA_TRUSTED_PROXY_SECRET: ${ASTRA_TRUSTED_PROXY_SECRET:?set ASTRA_TRUSTED_PROXY_SECRET}
+    depends_on: [astra-agent]
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-development-only}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/keycloak-realm.json:/opt/keycloak/data/import/astra-agent-realm.json:ro
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        until mc alias set local http://minio:9000
+        ${MINIO_ROOT_USER:-astra-development}
+        ${MINIO_ROOT_PASSWORD:-development-only-change-me}; do sleep 1; done;
+        mc mb --ignore-existing local/astra-artifacts

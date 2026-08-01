@@ -1,0 +1,12 @@
+[project]
+name = "astra-policy"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["astra-domain"]
+
+[tool.uv.sources]
+astra-domain = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

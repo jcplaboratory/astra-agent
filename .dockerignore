@@ -1,0 +1,11 @@
+.env
+.git
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+deploy/tls
+sources
+tests
+**/__pycache__
+**/*.pyc

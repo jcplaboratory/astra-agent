@@ -1,0 +1,19 @@
+[project]
+name = "astra-runtime"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "aiomysql>=0.2",
+  "alembic>=1.15",
+  "astra-domain",
+  "astra-policy",
+  "sqlalchemy[asyncio]>=2.0",
+]
+
+[tool.uv.sources]
+astra-domain = { workspace = true }
+astra-policy = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

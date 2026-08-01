@@ -1,0 +1,51 @@
+{
+  "realm": "astra-agent",
+  "enabled": true,
+  "sslRequired": "NONE",
+  "clients": [
+    {
+      "clientId": "astra-tui",
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "redirectUris": ["http://localhost/*"],
+      "protocolMappers": [
+        {
+          "name": "tenant-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true"
+          }
+        },
+        {
+          "name": "audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "astra-tui",
+            "access.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "astra-dev",
+      "enabled": true,
+      "email": "astra-dev@example.invalid",
+      "emailVerified": true,
+      "firstName": "Astra",
+      "lastName": "Developer",
+      "requiredActions": [],
+      "credentials": [{"type": "password", "value": "development-only", "temporary": false}],
+      "attributes": {"tenant_id": ["00000000-0000-0000-0000-000000000001"]}
+    }
+  ]
+}

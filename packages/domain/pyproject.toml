@@ -1,0 +1,9 @@
+[project]
+name = "astra-domain"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.11"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

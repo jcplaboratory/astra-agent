@@ -1,0 +1,32 @@
+[project]
+name = "astra-agent"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.38",
+  "boto3-stubs[s3]>=1.38",
+  "astra-domain",
+  "astra-memory",
+  "astra-model-providers",
+  "astra-protocol",
+  "astra-runtime",
+  "fastapi>=0.115",
+  "httpx>=0.28",
+  "pyjwt[crypto]>=2.10",
+  "pydantic-settings>=2.8",
+  "uvicorn[standard]>=0.34",
+]
+
+[project.scripts]
+astra-agent = "astra_agent.main:run"
+
+[tool.uv.sources]
+astra-domain = { workspace = true }
+astra-memory = { workspace = true }
+astra-model-providers = { workspace = true }
+astra-protocol = { workspace = true }
+astra-runtime = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
