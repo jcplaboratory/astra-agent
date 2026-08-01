@@ -1,4 +1,8 @@
-# Astra Agent
+<p align="center">
+  <img src="docs/assets/astra-agent.png" alt="Astra Agent" width="320">
+</p>
+
+<h1 align="center">Astra Agent</h1>
 
 Astra Agent is a hosted, multi-tenant Distributed Enriched-Persona Agent (D.E.P.A.). The
 Astra Agent control plane owns conversation, task, memory, policy, and audit state. Authenticated
