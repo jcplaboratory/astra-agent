@@ -70,24 +70,32 @@ assuming this statement remains true.
 
 Implement this milestone before broadening product scope.
 
-1. Add a durable background-job model and MariaDB queue for memory extraction, embedding/index
+1. Add a tenant-owned, versioned `PersonaProfile` with an immutable authored core for values,
+   boundaries, tone, initiative level, emotional range, and disagreement style. Store learned
+   adaptations separately; memory extraction must never modify the authored core.
+2. Add authenticated tenant-scoped persona read, update, and revert endpoints. Compile only the
+   active persona version into bounded context and record persona changes in the audit trail.
+3. Add a durable background-job model and MariaDB queue for memory extraction, embedding/index
    synchronization, and retryable maintenance work.
-2. Persist job attempts, state, next-attempt time, bounded exponential backoff, terminal failure,
+4. Persist job attempts, state, next-attempt time, bounded exponential backoff, terminal failure,
    tenant ownership, source record, and structured error details.
-3. Ensure raw conversations remain successful when local-model or Qdrant processing fails.
-4. Add an Astra Agent background runner that safely claims jobs with transactional locking and
+5. Ensure raw conversations remain successful when local-model or Qdrant processing fails.
+6. Add an Astra Agent background runner that safely claims jobs with transactional locking and
    supports graceful shutdown.
-5. Make memory extraction idempotent by source message and make Qdrant synchronization
+7. Make memory extraction idempotent by source message and make Qdrant synchronization
    recoverable after partial failure.
-6. Add authenticated, tenant-scoped artifact metadata and download endpoints using short-lived
+8. Add an optional local-model context reranking/compression adapter. Keep deterministic bounded
+   compilation as the fallback and preserve the configured context-token budget.
+9. Add authenticated, tenant-scoped artifact metadata and download endpoints using short-lived
    presigned GET URLs.
-7. Authorize every artifact through MariaDB before generating a URL; never trust an object key
+10. Authorize every artifact through MariaDB before generating a URL; never trust an object key
    supplied by the caller and never use S3 existence as authorization.
-8. Add artifact deletion/retention behavior with append-only audit events.
-9. Improve ARA resilience: heartbeat/offline status, lease renewal during long execution,
+11. Add artifact deletion/retention behavior with append-only audit events.
+12. Improve ARA resilience: heartbeat/offline status, lease renewal during long execution,
    cancellation observation, bounded retries, and structured failure reporting.
-10. Surface background failures, ARA health, and artifact downloads in the TUI without blocking
-    conversation input.
+13. Surface background failures, ARA health, artifact downloads, and active persona version in
+    the TUI without blocking
+   conversation input.
 
 ## Following milestone: richer orchestration
 
@@ -129,6 +137,8 @@ not production security controls.
 - MariaDB is always the authorization source of truth.
 - Qdrant payload filters must include tenant and visibility metadata, but are defense in depth only.
 - Persist raw user input before optional model, memory, vector, or ARA work.
+- The authored persona core is user/admin-controlled and immutable to automatic memory or model
+  updates; learned adaptations must be attributable, inspectable, and reversible.
 - Do not expose secrets in source, logs, tests, documentation, or final responses.
 - Do not add compatibility shims for the previous project name.
 - Do not weaken TLS/OIDC verification to make local tests pass.
@@ -153,8 +163,11 @@ and any production-only work that cannot be validated locally.
 
 ## Definition of done for the next milestone
 
+- The active persona is tenant-owned, versioned, auditable, and bounded in compiled context;
+  automatic memory processing cannot modify its authored core.
 - Conversation latency does not depend on memory extraction or Qdrant availability.
 - Failed memory/vector work is durable, visible, retryable, and idempotent.
+- Local-model context compression is optional, bounded, and has a deterministic fallback.
 - Restarting Astra Agent does not lose or duplicate queued work.
 - Artifact downloads are short-lived and authorized through MariaDB.
 - ARAs renew leases, report failures, observe cancellation, and become offline when heartbeats stop.
