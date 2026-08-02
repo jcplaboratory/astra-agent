@@ -10,20 +10,24 @@ from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Stati
 
 from astra_tui.settings import TUISettings
 
-WELCOME_TAGLINE = "Astra Agent · Distributed Enriched-Persona Agent"
-WELCOME_HINT = "Type a message and press Enter · Ctrl+T shows activity"
+WELCOME_TAGLINE = "Astra Agent"
+WELCOME_HINT = "Ask Astra to investigate, coordinate, or act. Press Enter to send."
 
 
 class AstraAgentApp(App[None]):
     CSS = """
     Screen { background: #0b0f17; color: #cbd5e1; }
-    Header { background: #0b0f17; color: #64748b; }
+    Header { background: #0b0f17; color: #94a3b8; }
     #status {
-        height: 1; padding: 0 2; background: #0b0f17; color: #475569;
+        height: 1; padding: 0 2; background: #0b0f17; color: #64748b;
         border-bottom: solid #11161f;
     }
     #conversation { height: 1fr; width: 1fr; padding: 0 2; }
     #conversation-log { height: 1fr; border: none; background: #0b0f17; }
+    #thinking { height: 1; color: #94a3b8; padding: 0 2; }
+    #thinking.hidden { display: none; }
+    #thinking-spinner { width: 5; margin: 0 1 0 0; color: #60a5fa; }
+    #thinking-text { width: auto; }
     #turn-approval {
         height: auto; padding: 0 2; dock: bottom;
         color: #f59e0b;
@@ -34,33 +38,46 @@ class AstraAgentApp(App[None]):
         layer: side;
         position: absolute;
         offset: 0 0;
-        width: 36; height: 100%;
-        background: #0b0f17;
-        border-left: solid #11161f;
-        padding: 1 1 1 1;
+        width: 34; height: 100%;
+        background: #141414;
+        border-right: solid #1e293b;
+        padding: 1 2;
         overflow: auto;
         display: block;
     }
     #side.hidden { display: none; }
-    .panel { height: auto; padding: 1 0; margin: 0; }
-    .panel .title { color: #475569; text-style: bold; padding: 0; }
+    #activity-title { color: #e2e8f0; text-style: bold; padding: 0; }
+    #activity-subtitle { color: #64748b; padding: 0 0 1 0; }
+    #new-conversation { width: 1fr; margin: 0 0 1 0; }
+    .panel { height: auto; padding: 1 0; margin: 0; border-top: solid #1e293b; }
+    .panel .title { color: #64748b; text-style: bold; padding: 0; }
     .panel Static { color: #94a3b8; }
     #approvals .title { color: #f59e0b; }
     #memories .title { color: #a78bfa; }
-    #message-input {
-        dock: bottom; margin: 0 2; height: 3;
-        border: none;
+    #memory-actions { height: 1; margin-top: 1; }
+    #memory-actions.hidden { display: none; }
+    #promote-memory, #reject-memory {
+        width: 1fr; min-width: 0; margin: 0 1 0 0;
+        color: #eeeeee; background: #1e1e1e; border: none;
     }
-    #message-input:focus { border: none; }
+    #promote-memory:focus, #reject-memory:focus { background: #fab283; color: #141414; }
+    #message-input {
+        dock: bottom; margin: 0 2 1 2; height: 3;
+        border: round #334155; background: #0f172a;
+    }
+    #message-input:focus { border: round #60a5fa; }
     Button { min-width: 6; height: 1; margin: 0 1 0 0; }
-    Footer { background: #0b0f17; color: #475569; }
+    Footer { background: #0b0f17; color: #64748b; }
     """
 
     TITLE = "Astra Agent"
     SUB_TITLE = "D.E.P.A."
 
     BINDINGS = [
-        ("ctrl+t", "toggle_side", "Activity"),
+        ("ctrl+t", "toggle_activity", "Activity"),
+        ("ctrl+n", "new_conversation", "New"),
+        ("escape", "focus_composer", "Composer"),
+        ("ctrl+l", "clear_conversation", "Clear"),
     ]
 
     def __init__(self) -> None:
@@ -75,6 +92,8 @@ class AstraAgentApp(App[None]):
         self.active_turn_id: str | None = None
         self.active_turn_paused = False
         self.latest_artifact_id: str | None = None
+        self.is_submitting = False
+        self.thinking_frame = 0
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -82,40 +101,49 @@ class AstraAgentApp(App[None]):
         with Vertical(id="conversation"):
             yield RichLog(id="conversation-log", wrap=True, markup=True)
             yield Static("", id="live-response")
+            with Horizontal(id="thinking", classes="hidden"):
+                yield Static("", id="thinking-spinner")
+                yield Static("Astra is thinking...", id="thinking-text")
             with Horizontal(id="turn-approval", classes="hidden"):
                 yield Static("", id="turn-approval-text")
                 yield Button("Grant", id="grant-inline", variant="success", disabled=True)
                 yield Button("Deny", id="deny-inline", variant="error", disabled=True)
         with Vertical(id="side", classes="hidden"):
+            yield Label("ASTRA", id="activity-title")
+            yield Static("D.E.P.A. workspace", id="activity-subtitle")
+            yield Button("+  New conversation", id="new-conversation", variant="primary")
+            with Vertical(id="sessions", classes="panel"):
+                yield Label("RECENT", classes="title")
+                yield Static("New conversation", id="conversation-list")
             with Vertical(id="tasks", classes="panel"):
-                yield Label("Tasks", classes="title")
+                yield Label("OPERATIONS", classes="title")
                 yield Static("No active delegations", id="task-list")
             with Vertical(id="approvals", classes="panel"):
-                yield Label("Approvals", classes="title")
+                yield Label("APPROVALS", classes="title")
                 yield Static("No pending approvals", id="approval-list")
                 with Horizontal():
                     yield Button("Grant", id="grant", variant="success", disabled=True)
                     yield Button("Deny", id="deny", variant="error", disabled=True)
             with Vertical(id="memories", classes="panel"):
-                yield Label("Memory", classes="title")
+                yield Label("MEMORY", classes="title")
                 yield Static("No approved memory", id="memory-list")
-                with Horizontal():
+                with Horizontal(id="memory-actions", classes="hidden"):
                     yield Button("Promote", id="promote-memory", disabled=True)
                     yield Button("Reject", id="reject-memory", disabled=True)
             with Vertical(id="jobs", classes="panel"):
-                yield Label("Failed jobs", classes="title")
+                yield Label("ISSUES", classes="title")
                 yield Static("No failed jobs", id="job-list")
             with Vertical(id="persona", classes="panel"):
-                yield Label("Active persona", classes="title")
+                yield Label("SYSTEM", classes="title")
                 yield Static("Loading…", id="persona-list")
             with Vertical(id="aras", classes="panel"):
-                yield Label("ARA health", classes="title")
+                yield Label("CONNECTED ARAS", classes="title")
                 yield Static("Loading…", id="ara-list")
             with Vertical(id="artifacts", classes="panel"):
-                yield Label("Artifacts", classes="title")
+                yield Label("ARTIFACTS", classes="title")
                 yield Static("No artifacts", id="artifact-list")
                 yield Button("Download latest", id="download-artifact", disabled=True)
-        yield Input(placeholder="Message Astra…", id="message-input", disabled=True)
+        yield Input(placeholder="Message Astra...", id="message-input", disabled=True)
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -157,16 +185,42 @@ class AstraAgentApp(App[None]):
         else:
             message_input.focus()
         self.set_interval(2, self.refresh_activity)
+        self.set_interval(0.18, self._animate_thinking)
 
     def _render_welcome(self) -> None:
         log = self.query_one("#conversation-log", RichLog)
-        log.write(f"[bold #93c5fd]{WELCOME_TAGLINE}[/]")
+        log.clear()
+        log.write(f"[bold #e2e8f0]{WELCOME_TAGLINE}[/]")
         log.write(f"[#64748b]{WELCOME_HINT}[/]")
         log.write("")
 
-    def action_toggle_side(self) -> None:
+    def action_toggle_activity(self) -> None:
         side = self.query_one("#side", Vertical)
         side.set_class(not side.has_class("hidden"), "hidden")
+
+    def action_focus_composer(self) -> None:
+        self.query_one("#message-input", Input).focus()
+
+    def action_new_conversation(self) -> None:
+        self.conversation_id = None
+        self.active_turn_id = None
+        self.active_turn_paused = False
+        self._render_welcome()
+        self.query_one("#status", Static).update("Astra Agent · new conversation")
+        self.action_focus_composer()
+
+    def action_clear_conversation(self) -> None:
+        self._render_welcome()
+        self.action_focus_composer()
+
+    def _animate_thinking(self) -> None:
+        if not self.is_submitting:
+            return
+        frames = ("⠋⠂⠂", "⠂⠙⠂", "⠂⠂⠹", "⠂⠸⠂", "⠼⠂⠂", "⠂⠴⠂")
+        self.query_one("#thinking-spinner", Static).update(
+            frames[self.thinking_frame % len(frames)]
+        )
+        self.thinking_frame += 1
 
     async def _development_login(self, settings: TUISettings) -> str:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -204,6 +258,9 @@ class AstraAgentApp(App[None]):
                 base_url=self.base_url, timeout=3, headers=self._user_headers()
             ) as client:
                 tasks_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/tasks")
+                conversations_response = await client.get(
+                    f"/api/v1/tenants/{self.tenant_id}/conversations"
+                )
                 approvals_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/approvals")
                 memories_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/memories")
                 jobs_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/jobs")
@@ -211,6 +268,7 @@ class AstraAgentApp(App[None]):
                 aras_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/aras")
                 artifacts_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/artifacts")
                 tasks_response.raise_for_status()
+                conversations_response.raise_for_status()
                 approvals_response.raise_for_status()
                 memories_response.raise_for_status()
                 jobs_response.raise_for_status()
@@ -218,6 +276,7 @@ class AstraAgentApp(App[None]):
                 aras_response.raise_for_status()
                 artifacts_response.raise_for_status()
             tasks = tasks_response.json()
+            conversations = conversations_response.json()
             approvals = [item for item in approvals_response.json() if item["state"] == "pending"]
             memories = memories_response.json()["memories"]
             failures = [item for item in jobs_response.json() if item["state"] == "failed"]
@@ -233,6 +292,13 @@ class AstraAgentApp(App[None]):
                 for item in tasks[-8:]
             ]
             self.query_one("#task-list", Static).update("\n".join(task_lines) or "No tasks")
+            conversation_lines = [
+                f"{'* ' if item['id'] == self.conversation_id else '  '}{item['title']}"
+                for item in conversations[-8:]
+            ]
+            self.query_one("#conversation-list", Static).update(
+                "\n".join(conversation_lines) or "New conversation"
+            )
             self.pending_approval_id = approvals[0]["id"] if approvals else None
             if approvals:
                 pending = approvals[0]
@@ -261,6 +327,9 @@ class AstraAgentApp(App[None]):
             can_review = bool(self.candidate_memory_id and (self.user_id or self.access_token))
             self.query_one("#promote-memory", Button).disabled = not can_review
             self.query_one("#reject-memory", Button).disabled = not can_review
+            self.query_one("#memory-actions", Horizontal).set_class(
+                not can_review, "hidden"
+            )
             enabled = bool(self.pending_approval_id and (self.user_id or self.access_token))
             self.query_one("#grant", Button).disabled = not enabled
             self.query_one("#deny", Button).disabled = not enabled
@@ -300,6 +369,9 @@ class AstraAgentApp(App[None]):
             return
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "new-conversation":
+            self.action_new_conversation()
+            return
         if event.button.id == "download-artifact":
             await self._download_artifact()
             return
@@ -364,7 +436,7 @@ class AstraAgentApp(App[None]):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         content = event.value.strip()
-        if not content or not self.tenant_id:
+        if not content or not self.tenant_id or self.is_submitting:
             return
         event.input.value = ""
         log = self.query_one("#conversation-log", RichLog)
@@ -374,6 +446,14 @@ class AstraAgentApp(App[None]):
     async def _submit_message(self, content: str) -> None:
         log = self.query_one("#conversation-log", RichLog)
         live = self.query_one("#live-response", Static)
+        message_input = self.query_one("#message-input", Input)
+        thinking = self.query_one("#thinking", Horizontal)
+        self.is_submitting = True
+        self.thinking_frame = 0
+        self.query_one("#thinking-spinner", Static).update("⠋⠂⠂")
+        message_input.disabled = True
+        thinking.remove_class("hidden")
+        self.query_one("#status", Static).update("Astra Agent · working")
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url, timeout=65, headers=self._user_headers()
@@ -407,19 +487,28 @@ class AstraAgentApp(App[None]):
                                 reasoning += chunk
                             else:
                                 answer += chunk
+                            thinking.add_class("hidden")
                             display = ""
                             if reasoning:
                                 display += f"Thinking\n{reasoning}\n\n"
-                            display += f"Astra\n{answer}"
+                            display += answer or "Working..."
                             live.update(Text(display))
                         elif line.startswith("data: ") and event == "tool_call":
                             tool = json.loads(line[6:]).get("tool", "tool")
-                            live.update(Text(f"Astra\nUsing {tool}..."))
+                            thinking.add_class("hidden")
+                            live.update(Text(f"Using {tool}..."))
             if answer:
                 log.write(f"[bold #86efac]Astra[/]: {answer}")
             live.update("")
         except (httpx.HTTPError, KeyError, ValueError) as error:
             log.write(f"[bold #fca5a5]Error[/]: {error}")
+        finally:
+            self.is_submitting = False
+            thinking.add_class("hidden")
+            message_input.disabled = not self._is_authenticated()
+            if not message_input.disabled:
+                message_input.focus()
+            self.query_one("#status", Static).update("Astra Agent · ready")
 
     def _user_headers(self) -> dict[str, str]:
         if self.access_token:

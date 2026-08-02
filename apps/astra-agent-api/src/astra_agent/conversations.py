@@ -19,6 +19,7 @@ from astra_domain import (
     ConversationTurnState,
     EventType,
     MessageRole,
+    RemoteAgentStatus,
     Task,
     TaskState,
     ToolInvocation,
@@ -50,7 +51,12 @@ _ARA_FILE_READ_CAPABILITY = Capability(kind=CapabilityKind.FILE_READ, scope="rep
 _COMMAND_CAPABILITY = Capability(kind=CapabilityKind.COMMAND_EXECUTE, scope="workspace")
 _ARA_DELEGATE_TOOL = ToolDefinition(
     name="delegate_ara",
-    description="Delegate bounded read-only repository inspection to an Astra Remote Agent.",
+    description=(
+        "Send a bounded, read-only repository inspection to a connected Astra Remote Agent "
+        "(ARA). Use it when the user asks you to inspect, search, or analyze a remote repository. "
+        "The ARA cannot execute commands, call arbitrary remote services, modify files, or access "
+        "anything outside its configured repository."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -60,6 +66,13 @@ _ARA_DELEGATE_TOOL = ToolDefinition(
         "required": ["objective"],
         "additionalProperties": False,
     },
+)
+_ARA_SYSTEM_GUIDANCE = (
+    "Remote repository capability: You can delegate bounded read-only repository inspection to "
+    "a connected Astra Remote Agent (ARA) with delegate_ara. Use it for remote repository "
+    "inspection, search, and analysis when useful. State this capability accurately: an ARA is "
+    "not a general remote-call mechanism. It cannot execute commands, make arbitrary network "
+    "calls, modify files, or access resources outside its configured repository."
 )
 
 
@@ -156,7 +169,7 @@ class ConversationOrchestrator:
         messages, iterations, pending_calls = await self._messages_for_turn(turn)
         if "planned_task_ids" in turn.checkpoint:
             messages.append(await self._sibling_provenance(turn))
-        elif self._delegation_enabled:
+        elif self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             planner = getattr(self._model_provider, "plan", None)
             try:
                 decision = (
@@ -227,7 +240,7 @@ class ConversationOrchestrator:
                     or turn
                 )
         definitions = self._tool_registry.definitions(turn.tenant_id)
-        if self._delegation_enabled:
+        if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
         known_tools = {definition.name for definition in definitions}
 
@@ -323,7 +336,7 @@ class ConversationOrchestrator:
     ) -> AsyncIterator[ModelStreamEvent]:
         messages, iterations, _ = await self._messages_for_turn(turn)
         definitions = self._tool_registry.definitions(turn.tenant_id)
-        if self._delegation_enabled:
+        if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
         streamer = getattr(self._model_provider, "stream", None)
         if not callable(streamer):
@@ -412,6 +425,28 @@ class ConversationOrchestrator:
         if user_message is None:
             raise LifecycleConflictError("turn user message is unavailable")
         briefing = await self._compiler.compile(turn.tenant_id, user_message.content)
+        ara_guidance = ""
+        if self._delegation_enabled:
+            available_aras = await self._store.list_remote_agents(turn.tenant_id)
+            has_repository_ara = any(
+                ara.status is RemoteAgentStatus.ACTIVE
+                and ara.trust_level > 0
+                and _ARA_FILE_READ_CAPABILITY in ara.capabilities
+                for ara in available_aras
+            )
+            ara_guidance = (
+                f"\n\n{_ARA_SYSTEM_GUIDANCE}\n\n"
+                + (
+                    "Current availability: A trusted ARA with repository access is connected. "
+                    "You may delegate an eligible repository inspection."
+                    if has_repository_ara
+                    else (
+                        "Current availability: No trusted ARA with repository access is connected. "
+                        "Do not claim that you can start a remote inspection now. Explain that an "
+                        "must connect first."
+                    )
+                )
+            )
         await self._store.append_event(
             AuditEvent(
                 tenant_id=turn.tenant_id,
@@ -426,7 +461,10 @@ class ConversationOrchestrator:
         )
         return (
             [
-                ModelMessage(role="system", content=briefing.content),
+                ModelMessage(
+                    role="system",
+                    content=f"{briefing.content}{ara_guidance}",
+                ),
                 *(ModelMessage(role=item.role.value, content=item.content) for item in history),
             ],
             0,
@@ -441,7 +479,7 @@ class ConversationOrchestrator:
         known_tools: set[str],
         messages: list[ModelMessage],
     ) -> ConversationTurn | None:
-        if call.name == _ARA_DELEGATE_TOOL.name:
+        if call.name == _ARA_DELEGATE_TOOL.name and call.name in known_tools:
             return await self._delegate_ara(turn, run_lease_id, call, messages)
         invocation_id = uuid4()
         invocation = await self._store.create_tool_invocation(
@@ -525,6 +563,16 @@ class ConversationOrchestrator:
             required_capabilities=(_ARA_FILE_READ_CAPABILITY,),
             deliverable_contract="Return bounded repository findings with file and line evidence.",
         )
+        if not await self._has_available_ara(turn.tenant_id):
+            messages.append(
+                self._tool_message(
+                    call.name,
+                    "No eligible connected ARA is available for read-only repository inspection. "
+                    "Explain that delegation cannot run until a trusted ARA with repository access "
+                    "connects; do not claim the inspection was started.",
+                )
+            )
+            return None
         await self._store.add_task(
             task,
             AuditEvent(
@@ -548,6 +596,14 @@ class ConversationOrchestrator:
             )
         )
         return await self._store.pause_turn(turn.tenant_id, turn.id, run_lease_id, turn.checkpoint)
+
+    async def _has_available_ara(self, tenant_id: UUID) -> bool:
+        return any(
+            ara.status is RemoteAgentStatus.ACTIVE
+            and ara.trust_level > 0
+            and _ARA_FILE_READ_CAPABILITY in ara.capabilities
+            for ara in await self._store.list_remote_agents(tenant_id)
+        )
 
     async def _checkpoint(
         self,

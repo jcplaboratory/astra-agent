@@ -480,6 +480,7 @@ def create_app(
         task_state: TaskState,
         detail: str,
         artifact_store: ArtifactStore | None = None,
+        request: Request | None = None,
     ) -> TaskLifecycleResponse:
         verify_ara_message(body, principal)
         artifacts = body.artifacts if isinstance(body, CompleteTaskRequest) else ()
@@ -503,6 +504,8 @@ def create_app(
                 detail,
                 artifacts,
             )
+            if request is not None:
+                request.app.state.advance_turn(body.tenant_id)
             return TaskLifecycleResponse(task_id=task.id, state=task.state)
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
@@ -528,16 +531,22 @@ def create_app(
         body: CancelTaskRequest,
         principal: Annotated[ARAPrincipal, Depends(principal_dependency)],
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
+        request: Request,
     ) -> TaskLifecycleResponse:
-        return await finish(body, principal, runtime_store, TaskState.CANCELLED, body.reason)
+        return await finish(
+            body, principal, runtime_store, TaskState.CANCELLED, body.reason, request=request
+        )
 
     @ara_api.post("/fail", response_model=TaskLifecycleResponse)
     async def fail_task(
         body: FailTaskRequest,
         principal: Annotated[ARAPrincipal, Depends(principal_dependency)],
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
+        request: Request,
     ) -> TaskLifecycleResponse:
-        return await finish(body, principal, runtime_store, TaskState.FAILED, body.error)
+        return await finish(
+            body, principal, runtime_store, TaskState.FAILED, body.error, request=request
+        )
 
     @ara_api.post("/approvals", response_model=ApprovalResponse, status_code=201)
     async def request_approval(

@@ -171,6 +171,22 @@ async def test_planner_failure_falls_back_to_regular_completion() -> None:
     provider = FailingPlannerProvider((ModelCompletion(content="Direct response."),))
     store = InMemoryRuntimeStore()
     conversation = await _conversation(store, tenant_id, user_id)
+    ara_id = uuid4()
+    await store.register_ara(
+        RemoteAgent(
+            id=ara_id,
+            tenant_id=tenant_id,
+            name="repository",
+            capabilities=(Capability(kind=CapabilityKind.FILE_READ, scope="repository"),),
+            runtime_version="test",
+        ),
+        AuditEvent(
+            tenant_id=tenant_id,
+            event_type=EventType.ARA_REGISTERED,
+            actor_type=ActorType.ARA,
+            actor_id=ara_id,
+        ),
+    )
     orchestrator = ConversationOrchestrator(
         store,
         BoundedContextCompiler("safe persona"),
@@ -255,6 +271,21 @@ async def test_delegate_ara_pauses_then_resumes_with_task_result(tmp_path: Path)
     )
     store = InMemoryRuntimeStore()
     conversation = await _conversation(store, tenant_id, user_id)
+    await store.register_ara(
+        RemoteAgent(
+            id=ara_id,
+            tenant_id=tenant_id,
+            name="repository",
+            capabilities=(Capability(kind=CapabilityKind.FILE_READ, scope="repository"),),
+            runtime_version="test",
+        ),
+        AuditEvent(
+            tenant_id=tenant_id,
+            event_type=EventType.ARA_REGISTERED,
+            actor_type=ActorType.ARA,
+            actor_id=ara_id,
+        ),
+    )
     orchestrator = ConversationOrchestrator(
         store,
         BoundedContextCompiler("safe persona"),
@@ -267,6 +298,9 @@ async def test_delegate_ara_pauses_then_resumes_with_task_result(tmp_path: Path)
     paused = await orchestrator.advance_one(tenant_id)
 
     assert paused is not None and paused.state is ConversationTurnState.PAUSED
+    assert "Remote repository capability" in provider.requests[0][0].content
+    assert "ARA with repository access is connected" in provider.requests[0][0].content
+    assert "not a general remote-call mechanism" in provider.requests[0][0].content
     assert provider.requests[0] and provider.requests[0][-1].role == "user"
     task = (await store.list_tasks(tenant_id))[0]
     assert task.context == "only auth files"
@@ -277,21 +311,6 @@ async def test_delegate_ara_pauses_then_resumes_with_task_result(tmp_path: Path)
     assert invocation is not None
     assert invocation.target is ToolInvocationTarget.ARA
     assert invocation.task_id == task.id
-    await store.register_ara(
-        RemoteAgent(
-            id=ara_id,
-            tenant_id=tenant_id,
-            name="repository",
-            capabilities=task.required_capabilities,
-            runtime_version="test",
-        ),
-        AuditEvent(
-            tenant_id=tenant_id,
-            event_type=EventType.ARA_REGISTERED,
-            actor_type=ActorType.ARA,
-            actor_id=ara_id,
-        ),
-    )
     leased = await store.lease_task(tenant_id, ara_id, datetime.now(UTC) + timedelta(minutes=1))
     assert leased is not None
     _, lease = leased
@@ -303,6 +322,32 @@ async def test_delegate_ara_pauses_then_resumes_with_task_result(tmp_path: Path)
 
     assert completed is not None and completed.state is ConversationTurnState.COMPLETED
     assert "auth is sound" in provider.requests[1][-1].content
+
+
+async def test_delegate_ara_reports_when_no_eligible_agent_is_connected() -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    provider = ScriptedProvider(
+        (
+            ModelCompletion(content="No ARA is currently connected."),
+        )
+    )
+    store = InMemoryRuntimeStore()
+    conversation = await _conversation(store, tenant_id, user_id)
+    orchestrator = ConversationOrchestrator(
+        store,
+        BoundedContextCompiler("safe persona"),
+        provider,
+        12,
+        tool_registry=LocalToolRegistry(Settings(tenant_workspaces={})),
+    )
+    await orchestrator.start_turn(tenant_id, user_id, conversation.id, uuid4(), "Inspect auth")
+
+    completed = await orchestrator.advance_one(tenant_id)
+
+    assert completed is not None and completed.state is ConversationTurnState.COMPLETED
+    assert not await store.list_tasks(tenant_id)
+    assert "No trusted ARA with repository access is connected" in provider.requests[0][0].content
+    assert all(tool.name != "delegate_ara" for tool in provider.tools[0])
 
 
 async def test_planned_siblings_are_distinct_targeted_and_report_partial_failure() -> None:

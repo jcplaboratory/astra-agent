@@ -32,7 +32,6 @@ class IdentityAwareModelProvider:
         self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
     ) -> ModelCompletion:
         self.system_message = messages[0].content
-        assert tools
         if "Identity: You are Astra" in self.system_message and "provider" in self.system_message:
             return ModelCompletion(content="I am Astra, your personal agent.")
         return ModelCompletion(content="I am Claude.")

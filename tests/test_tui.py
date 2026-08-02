@@ -3,6 +3,7 @@ from uuid import uuid4
 import httpx
 import jwt
 from astra_tui import AstraAgentApp
+from textual.containers import Horizontal
 from textual.widgets import Button, Input, Static
 
 
@@ -20,9 +21,11 @@ async def test_tui_mounts_task_and_approval_views(monkeypatch: object) -> None:
         assert app.query_one("#deny", Button).disabled
         assert app.query_one("#promote-memory", Button).disabled
         assert app.query_one("#reject-memory", Button).disabled
+        assert app.query_one("#memory-actions", Horizontal).has_class("hidden")
         assert app.query_one("#grant-inline", Button).disabled
         assert app.query_one("#deny-inline", Button).disabled
         assert app.query_one("#memory-list", Static)
+        assert app.query_one("#conversation-list", Static)
         assert app.query_one("#persona-list", Static)
         assert app.query_one("#ara-list", Static)
         assert app.query_one("#artifact-list", Static)
@@ -75,3 +78,42 @@ async def test_tui_development_login_enables_message_input(monkeypatch: object) 
         await pilot.pause()
         assert app.tenant_id == str(tenant_id)
         assert not app.query_one("#message-input", Input).disabled
+
+
+async def test_tui_conversation_shortcuts_reset_and_focus(monkeypatch: object) -> None:
+    monkeypatch.setenv("ASTRA_AGENT_URL", "http://127.0.0.1:1")
+    monkeypatch.delenv("ASTRA_TENANT_ID", raising=False)
+    monkeypatch.delenv("ASTRA_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("ASTRA_TUI_DEV_LOGIN", "false")
+    app = AstraAgentApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        app.conversation_id = str(uuid4())
+        await pilot.press("ctrl+n")
+        assert app.conversation_id is None
+        await pilot.press("ctrl+t")
+        assert not app.query_one("#side").has_class("hidden")
+        await pilot.press("ctrl+t")
+        assert app.query_one("#side").has_class("hidden")
+
+        app.conversation_id = str(uuid4())
+        await pilot.press("ctrl+t")
+        await pilot.click("#new-conversation")
+        assert app.conversation_id is None
+
+
+async def test_tui_shows_thinking_indicator_while_submitting(monkeypatch: object) -> None:
+    monkeypatch.setenv("ASTRA_AGENT_URL", "http://127.0.0.1:1")
+    monkeypatch.delenv("ASTRA_TENANT_ID", raising=False)
+    monkeypatch.delenv("ASTRA_ACCESS_TOKEN", raising=False)
+    monkeypatch.setenv("ASTRA_TUI_DEV_LOGIN", "false")
+    app = AstraAgentApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        thinking = app.query_one("#thinking", Horizontal)
+        assert thinking.has_class("hidden")
+        thinking.remove_class("hidden")
+        assert not thinking.has_class("hidden")
+        app.is_submitting = True
+        app._animate_thinking()
+        assert str(app.query_one("#thinking-spinner", Static).render()).strip()
