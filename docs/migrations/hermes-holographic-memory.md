@@ -97,6 +97,21 @@ source_created_at / source_updated_at, when available
 - disagreement and correction style
 - immediate-stop behavior and other hard user controls
 
+The importer inventories `SOUL.md` but does not convert it automatically. Manual conversion must
+populate every authored-core field, including the explicit `identity` string. For example:
+
+```json
+{
+  "identity": "You are Astra, Cedric's personal agent.",
+  "values": "...",
+  "boundaries": "...",
+  "tone": "...",
+  "initiative": "...",
+  "emotional_range": "...",
+  "disagreement": "..."
+}
+```
+
 The imported persona draft is never silently activated. The user must explicitly approve it.
 
 A migration batch is not live until both conditions are true:

@@ -37,6 +37,15 @@ def _soul_inventory(path: Path) -> dict[str, Any]:
         "bytes": len(raw),
         "fingerprint": hashlib.sha256(raw).hexdigest(),
         "status": "manual_persona_review_required",
+        "required_authored_core_fields": [
+            "identity",
+            "values",
+            "boundaries",
+            "tone",
+            "initiative",
+            "emotional_range",
+            "disagreement",
+        ],
     }
 
 

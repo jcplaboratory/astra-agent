@@ -23,6 +23,23 @@ class FailingModelProvider:
         return None
 
 
+class IdentityAwareModelProvider:
+    def __init__(self) -> None:
+        self.system_message = ""
+
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
+    ) -> ModelCompletion:
+        self.system_message = messages[0].content
+        assert tools
+        if "Identity: You are Astra" in self.system_message and "provider" in self.system_message:
+            return ModelCompletion(content="I am Astra, your personal agent.")
+        return ModelCompletion(content="I am Claude.")
+
+    async def close(self) -> None:
+        return None
+
+
 def _headers(tenant_id: object) -> dict[str, str]:
     return {"X-Astra-Tenant-ID": str(tenant_id), "X-Astra-User-ID": str(uuid4())}
 
@@ -91,9 +108,54 @@ def test_user_message_survives_model_failure() -> None:
         assert events[-1]["event_type"] == "model.failed"
 
 
+def test_model_receives_astra_identity_and_does_not_claim_provider_name() -> None:
+    tenant_id = uuid4()
+    headers = _headers(tenant_id)
+    provider = IdentityAwareModelProvider()
+    with TestClient(create_app(model_provider=provider)) as client:
+        persona = client.put(
+            f"/api/v1/tenants/{tenant_id}/persona",
+            headers=headers,
+            json={
+                "tenant_id": str(tenant_id),
+                "authored_core": {
+                    "identity": "You are Astra, a trusted personal agent.",
+                    "values": "Help users",
+                    "boundaries": "Be honest",
+                    "tone": "Direct",
+                    "initiative": "Offer next steps",
+                    "emotional_range": "Measured",
+                    "disagreement": "Be respectful",
+                },
+            },
+        )
+        assert persona.status_code == 200
+        conversation = client.post(
+            "/api/v1/conversations",
+            headers=headers,
+            json={"tenant_id": str(tenant_id)},
+        ).json()["conversation"]
+        response = client.post(
+            f"/api/v1/conversations/{conversation['id']}/messages",
+            headers=headers,
+            json={
+                "tenant_id": str(tenant_id),
+                "client_request_id": str(uuid4()),
+                "content": "Are you Claude?",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "I am Astra, your personal agent."
+    assert provider.system_message.startswith("Identity: You are Astra, a trusted personal agent.")
+    assert "Never claim to be Claude, Anthropic, OpenAI" in provider.system_message
+
+
 async def test_context_compiler_enforces_budget() -> None:
     compiler = BoundedContextCompiler("persona " * 1_000, max_tokens=100)
     briefing = await compiler.compile(uuid4(), "objective " * 1_000)
+    assert briefing.content.startswith("Identity: You are Astra.")
+    assert "underlying model or provider" in briefing.content
     assert briefing.estimated_tokens <= 100
     assert len(briefing.content) <= 400
 
@@ -110,13 +172,15 @@ class ContextLocalModel:
 
 
 async def test_local_context_compression_is_bounded_and_falls_back() -> None:
-    fallback = BoundedContextCompiler("persona", max_tokens=10)
-    compressed = LocalModelContextCompressor(fallback, ContextLocalModel("x" * 100), 10)
+    fallback = BoundedContextCompiler("persona", max_tokens=50)
+    compressed = LocalModelContextCompressor(fallback, ContextLocalModel("x" * 500), 50)
     briefing = await compressed.compile(uuid4(), "objective")
+    assert briefing.content.startswith("Identity: You are Astra.")
+    assert "underlying model or provider" in briefing.content
     assert briefing.content.endswith("...")
-    assert briefing.estimated_tokens <= 10
+    assert briefing.estimated_tokens <= 50
 
-    unavailable = LocalModelContextCompressor(fallback, ContextLocalModel(RuntimeError()), 10)
+    unavailable = LocalModelContextCompressor(fallback, ContextLocalModel(RuntimeError()), 50)
     tenant_id = uuid4()
     assert await unavailable.compile(tenant_id, "objective") == await fallback.compile(
         tenant_id, "objective"

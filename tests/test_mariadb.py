@@ -302,6 +302,7 @@ async def test_mariadb_activation_promotes_only_batch_candidates() -> None:
             batch.id,
             actor_id,
             PersonaCore(
+                identity="You are Astra.",
                 values="v",
                 boundaries="b",
                 tone="t",

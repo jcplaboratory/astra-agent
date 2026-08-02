@@ -17,7 +17,7 @@ from astra_domain import (
 )
 from astra_model_providers import LocalModelProvider
 
-from astra_memory.compiler import ContextBriefing
+from astra_memory.compiler import ContextBriefing, persona_identity_prefix
 
 
 class MemoryRepository(Protocol):
@@ -356,10 +356,11 @@ class MemoryContextCompiler:
             )[: self._memory_limit]
         profile = await self._repository.get_active_persona(tenant_id)
         persona = (
-            self._persona_kernel
+            f"{persona_identity_prefix()}\nPersona guidance: {self._persona_kernel}"
             if profile is None
             else "\n".join(
                 (
+                    persona_identity_prefix(profile.authored_core.identity),
                     f"Values: {profile.authored_core.values}",
                     f"Boundaries: {profile.authored_core.boundaries}",
                     f"Tone: {profile.authored_core.tone}",
@@ -369,7 +370,7 @@ class MemoryContextCompiler:
                 )
             )
         )
-        sections = [f"Persona:\n{persona}"]
+        sections = [persona]
         if ranked:
             sections.append(
                 "Relevant approved memory:\n"

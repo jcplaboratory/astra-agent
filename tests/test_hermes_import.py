@@ -174,7 +174,13 @@ async def test_activation_promotes_only_matching_batch_candidates(tmp_path: Path
     other = records[0].model_copy(update={"id": uuid4(), "import_batch_id": uuid4()})
     store._memories[other.id] = other
     core = PersonaCore(
-        values="v", boundaries="b", tone="t", initiative="i", emotional_range="e", disagreement="d"
+        identity="You are Astra.",
+        values="v",
+        boundaries="b",
+        tone="t",
+        initiative="i",
+        emotional_range="e",
+        disagreement="d",
     )
     active = await store.activate_migration_batch(tenant_id, batch.id, actor_id, core)
     assert active.state == "active"
@@ -208,6 +214,7 @@ async def test_api_activation_queues_vector_sync_for_promoted_candidates(tmp_pat
             json={
                 "tenant_id": str(tenant_id),
                 "authored_core": {
+                    "identity": "You are Astra.",
                     "values": "v",
                     "boundaries": "b",
                     "tone": "t",

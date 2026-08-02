@@ -13,6 +13,7 @@ def _headers(tenant_id: object) -> dict[str, str]:
 
 def _core(values: str = "Help users") -> dict[str, str]:
     return {
+        "identity": "You are Astra, a trusted personal agent.",
         "values": values,
         "boundaries": "Do not claim certainty without evidence",
         "tone": "Direct and kind",
@@ -60,8 +61,10 @@ def test_persona_is_tenant_scoped_versioned_revertible_and_audited() -> None:
 async def test_active_persona_is_compiled_within_bound_and_falls_back_to_settings_kernel() -> None:
     store = InMemoryRuntimeStore()
     tenant_id = uuid4()
-    compiler = MemoryContextCompiler(store, NullVectorIndex(), "fallback persona", max_tokens=20)
-    assert "fallback persona" in (await compiler.compile(tenant_id, "objective")).content
+    compiler = MemoryContextCompiler(store, NullVectorIndex(), "fallback persona", max_tokens=100)
+    fallback = (await compiler.compile(tenant_id, "objective")).content
+    assert fallback.startswith("Identity: You are Astra.")
+    assert "fallback persona" in fallback
     client = TestClient(create_app(store=store))
     with client:
         response = client.put(
@@ -71,8 +74,10 @@ async def test_active_persona_is_compiled_within_bound_and_falls_back_to_setting
         )
         assert response.status_code == 200
     briefing = await compiler.compile(tenant_id, "objective")
+    assert briefing.content.startswith("Identity: You are Astra, a trusted personal agent.")
+    assert briefing.content.index("Identity:") < briefing.content.index("Values:")
     assert "Values: " + "x" * 10 in briefing.content
-    assert briefing.estimated_tokens <= 20
+    assert briefing.estimated_tokens <= 100
 
 
 async def test_learned_adaptation_is_separate_and_reversible() -> None:

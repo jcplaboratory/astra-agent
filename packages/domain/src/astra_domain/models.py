@@ -359,6 +359,7 @@ class JobAttempt(TenantOwnedModel):
 
 
 class PersonaCore(DomainModel):
+    identity: str = Field(default="You are Astra.", min_length=1, max_length=200)
     values: str = Field(min_length=1, max_length=4_000)
     boundaries: str = Field(min_length=1, max_length=4_000)
     tone: str = Field(min_length=1, max_length=2_000)

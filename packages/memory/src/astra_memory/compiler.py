@@ -4,6 +4,28 @@ from uuid import UUID
 from astra_model_providers import LocalModelProvider
 from pydantic import BaseModel, ConfigDict, Field
 
+DEFAULT_PERSONA_IDENTITY = "You are Astra."
+IDENTITY_INVARIANT = (
+    "Never claim to be Claude, Anthropic, OpenAI, or any underlying model or provider; "
+    "the provider is an implementation detail."
+)
+
+
+def persona_identity_prefix(identity: str = DEFAULT_PERSONA_IDENTITY) -> str:
+    return f"Identity: {identity.strip()}\nIdentity invariant: {IDENTITY_INVARIANT}"
+
+
+def _identity_prefix_from(content: str) -> str:
+    lines = content.splitlines()
+    if not lines or not lines[0].startswith("Identity: "):
+        return persona_identity_prefix()
+    prefix = lines[0]
+    if len(lines) > 1 and lines[1].startswith("Identity invariant: "):
+        prefix += "\n" + lines[1]
+    else:
+        prefix += "\nIdentity invariant: " + IDENTITY_INVARIANT
+    return prefix
+
 
 class ContextBriefing(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -23,7 +45,10 @@ class BoundedContextCompiler:
         self._max_tokens = max_tokens
 
     async def compile(self, tenant_id: UUID, objective: str) -> ContextBriefing:
-        content = f"Persona:\n{self._persona_kernel}\n\nCurrent objective:\n{objective.strip()}"
+        content = (
+            f"{persona_identity_prefix()}\n"
+            f"Persona guidance: {self._persona_kernel}\n\nCurrent objective:\n{objective.strip()}"
+        )
         max_characters = self._max_tokens * 4
         if len(content) > max_characters:
             content = content[: max_characters - 3].rstrip() + "..."
@@ -59,7 +84,12 @@ class LocalModelContextCompressor:
                 raise ValueError("local model returned empty context")
         except Exception:
             return briefing
-        content = self._bound(compressed)
+        identity_prefix = _identity_prefix_from(briefing.content)
+        compressed = compressed.strip()
+        if compressed.startswith(identity_prefix):
+            content = self._bound(compressed)
+        else:
+            content = self._bound(f"{identity_prefix}\n{compressed}")
         return ContextBriefing(
             tenant_id=tenant_id,
             content=content,
