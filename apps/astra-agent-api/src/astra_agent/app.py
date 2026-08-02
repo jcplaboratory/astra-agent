@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -10,6 +12,9 @@ from astra_domain import (
     ApprovalState,
     AuditEvent,
     Conversation,
+    ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     MemoryRecord,
     MemoryState,
@@ -46,7 +51,9 @@ from astra_protocol import (
     CancelTaskRequest,
     CompleteTaskRequest,
     ConversationResponse,
+    ConversationTurnQueryResponse,
     ConversationTurnResponse,
+    ConversationTurnsResponse,
     CreateConversationRequest,
     LeaseRequest,
     LeaseResponse,
@@ -82,6 +89,9 @@ from astra_agent.auth import (
 )
 from astra_agent.conversations import ConversationOrchestrator
 from astra_agent.settings import Settings
+from astra_agent.tools import LocalToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class HealthResponse(BaseModel):
@@ -101,6 +111,23 @@ class ARAMessage(Protocol):
 
     @property
     def ara_id(self) -> UUID: ...
+
+
+def _assistant_message_for_turn(
+    messages: tuple[ConversationMessage, ...], turn: ConversationTurn
+) -> ConversationMessage | None:
+    try:
+        user_index = next(
+            index for index, item in enumerate(messages) if item.id == turn.user_message_id
+        )
+    except StopIteration:
+        return None
+    for item in messages[user_index + 1 :]:
+        if item.role.value == "user":
+            return None
+        if item.role.value == "assistant":
+            return item
+    return None
 
 
 def _store(request: Request) -> RuntimeStore:
@@ -195,8 +222,50 @@ def create_app(
             settings.persona_max_tokens,
             settings.memory_max_records,
         )
+        app.state.tool_registry = LocalToolRegistry(settings)
+        app.state.orchestrator = ConversationOrchestrator(
+            app.state.store,
+            app.state.context_compiler,
+            app.state.model_provider,
+            settings.conversation_history_messages,
+            app.state.memory_pipeline,
+            settings.delegation_wait_seconds,
+            settings.delegation_poll_seconds,
+            settings.delegation_enabled,
+            app.state.tool_registry,
+        )
+        runner_tasks: dict[UUID, asyncio.Task[None]] = {}
+
+        async def run_pending_turns(tenant_id: UUID) -> None:
+            try:
+                while await app.state.orchestrator.advance_one(tenant_id) is not None:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("conversation turn runner failed for tenant %s", tenant_id)
+            finally:
+                task = asyncio.current_task()
+                if task is not None and runner_tasks.get(tenant_id) is task:
+                    del runner_tasks[tenant_id]
+
+        def advance_turn(tenant_id: UUID) -> asyncio.Task[None]:
+            task = runner_tasks.get(tenant_id)
+            if task is None or task.done():
+                task = asyncio.create_task(
+                    run_pending_turns(tenant_id), name=f"conversation-turns-{tenant_id}"
+                )
+                runner_tasks[tenant_id] = task
+            return task
+
+        app.state.advance_turn = advance_turn
         await app.state.vector_index.ensure_ready()
         yield
+        tasks = tuple(runner_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await app.state.vector_index.close()
         if app.state.local_model_provider is not None:
             await app.state.local_model_provider.close()
@@ -493,6 +562,7 @@ def create_app(
         conversation_id: UUID,
         body: SendMessageRequest,
         request: Request,
+        response: Response,
         principal: Annotated[UserPrincipal, Depends(_user_principal)],
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
     ) -> ConversationTurnResponse:
@@ -501,24 +571,67 @@ def create_app(
         conversation = await runtime_store.get_conversation(body.tenant_id, conversation_id)
         if conversation is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
-        orchestrator = ConversationOrchestrator(
-            runtime_store,
-            request.app.state.context_compiler,
-            request.app.state.model_provider,
-            settings.conversation_history_messages,
-            request.app.state.memory_pipeline,
-            settings.delegation_wait_seconds,
-            settings.delegation_poll_seconds,
-            settings.delegation_enabled,
-        )
         try:
-            user_message, assistant_message = await orchestrator.respond(
-                body.tenant_id, principal.user_id, conversation_id, body.content
+            user_message, turn = await request.app.state.orchestrator.start_turn(
+                body.tenant_id,
+                principal.user_id,
+                conversation_id,
+                body.client_request_id,
+                body.content,
             )
+            await request.app.state.orchestrator.advance_one(body.tenant_id)
         except ModelProviderError as error:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, "model provider failed") from error
+        refreshed = await runtime_store.get_turn(body.tenant_id, turn.id)
+        if refreshed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation turn not found")
+        messages = await runtime_store.list_messages(body.tenant_id, conversation_id)
+        assistant_message = _assistant_message_for_turn(messages, refreshed)
+        if refreshed.state is not ConversationTurnState.COMPLETED:
+            response.status_code = status.HTTP_202_ACCEPTED
+        request.app.state.advance_turn(body.tenant_id)
         return ConversationTurnResponse(
-            user_message=user_message, assistant_message=assistant_message
+            turn=refreshed, user_message=user_message, assistant_message=assistant_message
+        )
+
+    @api.get(
+        "/conversations/{conversation_id}/turns",
+        response_model=ConversationTurnsResponse,
+        tags=["conversations"],
+    )
+    async def list_conversation_turns(
+        conversation_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ConversationTurnsResponse:
+        conversation = await runtime_store.get_conversation(principal.tenant_id, conversation_id)
+        if conversation is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
+        return ConversationTurnsResponse(
+            turns=await runtime_store.list_conversation_turns(principal.tenant_id, conversation_id)
+        )
+
+    @api.get(
+        "/conversation-turns/{turn_id}",
+        response_model=ConversationTurnQueryResponse,
+        tags=["conversations"],
+    )
+    async def get_conversation_turn(
+        turn_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ConversationTurnQueryResponse:
+        turn = await runtime_store.get_turn(principal.tenant_id, turn_id)
+        if turn is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation turn not found")
+        messages = await runtime_store.list_messages(principal.tenant_id, turn.conversation_id)
+        user_message = next((item for item in messages if item.id == turn.user_message_id), None)
+        if user_message is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "turn user message not found")
+        return ConversationTurnQueryResponse(
+            turn=turn,
+            user_message=user_message,
+            assistant_message=_assistant_message_for_turn(messages, turn),
         )
 
     @api.get("/tenants/{tenant_id}/events", response_model=list[AuditEvent], tags=["audit"])
@@ -650,6 +763,7 @@ def create_app(
     async def decide_approval(
         approval_id: UUID,
         body: ApprovalDecisionRequest,
+        request: Request,
         principal: Annotated[UserPrincipal, Depends(_user_principal)],
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
     ) -> ApprovalResponse:
@@ -657,11 +771,12 @@ def create_app(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
         state = ApprovalState.GRANTED if body.granted else ApprovalState.DENIED
         try:
-            return ApprovalResponse(
-                approval=await runtime_store.decide_approval(
-                    body.tenant_id, approval_id, state, principal.user_id
-                )
+            approval = await runtime_store.decide_approval(
+                body.tenant_id, approval_id, state, principal.user_id
             )
+            if approval.tool_invocation_id is not None:
+                request.app.state.advance_turn(body.tenant_id)
+            return ApprovalResponse(approval=approval)
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
 

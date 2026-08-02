@@ -1,4 +1,4 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import jwt
@@ -32,6 +32,10 @@ class AstraAgentApp(App[None]):
             with Vertical(id="conversation"):
                 yield Label("Conversation", classes="title")
                 yield RichLog(id="conversation-log", wrap=True)
+                with Horizontal(id="turn-approval"):
+                    yield Static("", id="turn-approval-text")
+                    yield Button("Grant", id="grant-inline", variant="success", disabled=True)
+                    yield Button("Deny", id="deny-inline", variant="error", disabled=True)
             with Vertical(id="side"):
                 with Vertical(id="tasks"):
                     yield Label("Tasks", classes="title")
@@ -60,6 +64,8 @@ class AstraAgentApp(App[None]):
         self.pending_approval_id: str | None = None
         self.conversation_id = str(settings.conversation_id) if settings.conversation_id else None
         self.candidate_memory_id: str | None = None
+        self.active_turn_id: str | None = None
+        self.active_turn_paused = False
         status = self.query_one("#status", Static)
         if not self.access_token and settings.tui_dev_login:
             try:
@@ -123,6 +129,7 @@ class AstraAgentApp(App[None]):
         if not self.tenant_id:
             self.query_one("#task-list", Static).update("Set ASTRA_TENANT_ID to view tasks")
             return
+        enabled = False
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url, timeout=3, headers=self._user_headers()
@@ -158,15 +165,47 @@ class AstraAgentApp(App[None]):
             self.query_one("#grant", Button).disabled = not enabled
             self.query_one("#deny", Button).disabled = not enabled
         except (httpx.HTTPError, KeyError, ValueError):
+            pass
+        await self._refresh_active_turn()
+        inline_enabled = bool(enabled and self.active_turn_paused)
+        self.query_one("#grant-inline", Button).disabled = not inline_enabled
+        self.query_one("#deny-inline", Button).disabled = not inline_enabled
+        self.query_one("#turn-approval-text", Static).update(
+            "Approval required for this turn" if inline_enabled else ""
+        )
+
+    async def _refresh_active_turn(self) -> None:
+        if not self.active_turn_id:
+            return
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=3, headers=self._user_headers()
+            ) as client:
+                response = await client.get(f"/api/v1/conversation-turns/{self.active_turn_id}")
+                response.raise_for_status()
+            payload = response.json()
+            self.active_turn_paused = payload["turn"]["state"] == "paused"
+            if payload["turn"]["state"] != "completed":
+                return
+            assistant = payload.get("assistant_message")
+            if isinstance(assistant, dict) and isinstance(assistant.get("content"), str):
+                self.query_one("#conversation-log", RichLog).write(
+                    f"[bold #86efac]Astra[/]: {assistant['content']}"
+                )
+            self.active_turn_id = None
+            self.active_turn_paused = False
+        except (httpx.HTTPError, KeyError, ValueError):
             return
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id in {"promote-memory", "reject-memory"}:
             await self._review_memory(event.button.id == "promote-memory")
             return
+        if event.button.id not in {"grant", "deny", "grant-inline", "deny-inline"}:
+            return
         if not self.pending_approval_id or not self.tenant_id:
             return
-        granted = event.button.id == "grant"
+        granted = event.button.id in {"grant", "grant-inline"}
         headers = self._user_headers()
         try:
             UUID(self.tenant_id)
@@ -199,14 +238,17 @@ class AstraAgentApp(App[None]):
         except httpx.HTTPError:
             return
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_input_submitted(self, event: Input.Submitted) -> None:
         content = event.value.strip()
         if not content or not self.tenant_id:
             return
         event.input.value = ""
-        event.input.disabled = True
         log = self.query_one("#conversation-log", RichLog)
         log.write(f"[bold #93c5fd]You[/]: {content}")
+        self.run_worker(self._submit_message(content), exclusive=False)
+
+    async def _submit_message(self, content: str) -> None:
+        log = self.query_one("#conversation-log", RichLog)
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url, timeout=65, headers=self._user_headers()
@@ -220,16 +262,23 @@ class AstraAgentApp(App[None]):
                     self.conversation_id = response.json()["conversation"]["id"]
                 response = await client.post(
                     f"/api/v1/conversations/{self.conversation_id}/messages",
-                    json={"tenant_id": self.tenant_id, "content": content},
+                    json={
+                        "tenant_id": self.tenant_id,
+                        "client_request_id": str(uuid4()),
+                        "content": content,
+                    },
                 )
                 response.raise_for_status()
-            assistant = response.json()["assistant_message"]["content"]
+            payload = response.json()
+            if response.status_code == httpx.codes.ACCEPTED:
+                self.active_turn_id = payload["turn"]["id"]
+                self.active_turn_paused = payload["turn"]["state"] == "paused"
+                log.write("[bold #fcd34d]Astra[/]: Working on your request...")
+                return
+            assistant = payload["assistant_message"]["content"]
             log.write(f"[bold #86efac]Astra[/]: {assistant}")
         except (httpx.HTTPError, KeyError, ValueError) as error:
             log.write(f"[bold #fca5a5]Error[/]: {error}")
-        finally:
-            event.input.disabled = False
-            event.input.focus()
 
     def _user_headers(self) -> dict[str, str]:
         if self.access_token:

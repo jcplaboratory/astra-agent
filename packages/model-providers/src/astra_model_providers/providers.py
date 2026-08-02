@@ -1,8 +1,9 @@
-from typing import Any
+import json
+from typing import Any, overload
 
 import httpx
 
-from astra_model_providers.interfaces import ModelMessage
+from astra_model_providers.interfaces import ModelCompletion, ModelMessage, ToolCall, ToolDefinition
 
 
 class ModelProviderError(Exception):
@@ -10,7 +11,17 @@ class ModelProviderError(Exception):
 
 
 class DevelopmentModelProvider:
-    async def complete(self, messages: tuple[ModelMessage, ...]) -> str:
+    @overload
+    async def complete(self, messages: tuple[ModelMessage, ...]) -> str: ...
+
+    @overload
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
+    ) -> ModelCompletion: ...
+
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...] | None = None
+    ) -> str | ModelCompletion:
         ara_findings = next(
             (
                 message.content.split("\n\n", 1)[-1]
@@ -20,7 +31,8 @@ class DevelopmentModelProvider:
             None,
         )
         if ara_findings:
-            return f"Repository inspection completed:\n\n{ara_findings}"
+            content = f"Repository inspection completed:\n\n{ara_findings}"
+            return ModelCompletion(content=content) if tools is not None else content
         pending = next(
             (
                 message.content
@@ -30,11 +42,12 @@ class DevelopmentModelProvider:
             None,
         )
         if pending:
-            return pending
+            return ModelCompletion(content=pending) if tools is not None else pending
         user_message = next(
             (message.content for message in reversed(messages) if message.role == "user"), ""
         )
-        return f"Development model received: {user_message}"
+        content = f"Development model received: {user_message}"
+        return ModelCompletion(content=content) if tools is not None else content
 
     async def close(self) -> None:
         return None
@@ -57,22 +70,63 @@ class OpenRouterModelProvider:
         )
         self._owns_client = client is None
 
-    async def complete(self, messages: tuple[ModelMessage, ...]) -> str:
+    @overload
+    async def complete(self, messages: tuple[ModelMessage, ...]) -> str: ...
+
+    @overload
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
+    ) -> ModelCompletion: ...
+
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...] | None = None
+    ) -> str | ModelCompletion:
         try:
+            request: dict[str, Any] = {
+                "model": self.model,
+                "messages": [message.model_dump() for message in messages],
+            }
+            if tools is not None:
+                request["tools"] = [
+                    {
+                        "type": "function",
+                        "function": tool.model_dump(),
+                    }
+                    for tool in tools
+                ]
             response = await self._client.post(
                 "/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [message.model_dump() for message in messages],
-                },
+                json=request,
             )
             response.raise_for_status()
             payload: dict[str, Any] = response.json()
-            content = payload["choices"][0]["message"]["content"]
-            if not isinstance(content, str) or not content:
+            message = payload["choices"][0]["message"]
+            content = message.get("content")
+            if tools is None:
+                if not isinstance(content, str) or not content:
+                    raise ValueError("model returned empty content")
+                return content
+            if content is not None and not isinstance(content, str):
+                raise ValueError("model returned invalid content")
+            tool_calls = tuple(
+                ToolCall(
+                    id=call["id"],
+                    name=call["function"]["name"],
+                    arguments=json.loads(call["function"]["arguments"]),
+                )
+                for call in message.get("tool_calls", [])
+            )
+            if content is None and not tool_calls:
                 raise ValueError("model returned empty content")
-            return content
-        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as error:
+            return ModelCompletion(content=content, tool_calls=tool_calls)
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
             raise ModelProviderError("OpenRouter request failed") from error
 
     async def close(self) -> None:

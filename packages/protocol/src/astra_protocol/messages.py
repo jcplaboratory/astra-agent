@@ -6,6 +6,7 @@ from astra_domain import (
     Capability,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
     Lease,
     MemoryRecord,
     RemoteAgent,
@@ -100,6 +101,7 @@ class CreateConversationRequest(Message):
 
 class SendMessageRequest(Message):
     tenant_id: UUID
+    client_request_id: UUID
     content: str = Field(min_length=1, max_length=50_000)
 
 
@@ -109,8 +111,19 @@ class ConversationResponse(Message):
 
 
 class ConversationTurnResponse(Message):
+    turn: ConversationTurn | None = None
     user_message: ConversationMessage
-    assistant_message: ConversationMessage
+    assistant_message: ConversationMessage | None = None
+
+
+class ConversationTurnQueryResponse(Message):
+    turn: ConversationTurn
+    user_message: ConversationMessage
+    assistant_message: ConversationMessage | None = None
+
+
+class ConversationTurnsResponse(Message):
+    turns: tuple[ConversationTurn, ...]
 
 
 class MemoryListResponse(Message):

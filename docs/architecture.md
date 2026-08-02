@@ -98,9 +98,9 @@ flowchart TB
 
 ## Conversation Flow
 
-The current conversation route persists the user message first, runs best-effort memory
-processing, compiles bounded context, optionally delegates repository inspection, invokes the
-main model, and persists the assistant response.
+The conversation route persists the user message first, runs best-effort memory processing,
+compiles bounded context, then runs a bounded model-directed tool loop before persisting the
+assistant response.
 
 ```mermaid
 sequenceDiagram
@@ -126,14 +126,14 @@ sequenceDiagram
     A->>Q: Rank only MariaDB-authorized memory IDs
     Q-->>A: Ranked allowed IDs
     A->>A: Compile bounded persona/memory briefing
-    opt Explicit repository inspection request
-        A->>DB: Create read-only task
+    opt Model calls delegate_ara
+        A->>DB: Create read-only task and linked tool invocation
         R->>A: Pull bounded lease over mTLS
         R->>R: Inspect configured repository
-        R->>A: Report progress and structured findings
-        A->>DB: Persist task result and audit events
+        R->>A: Report structured findings
+        A->>DB: Persist result, complete invocation, and wake turn
     end
-    A->>L: Briefing + bounded history + optional ARA findings
+    A->>L: Briefing + bounded history + tool findings
     L-->>A: Assistant response
     A->>DB: Persist assistant message and audit event
     A-->>T: Conversation turn response
@@ -144,9 +144,9 @@ sequenceDiagram
 
 - **Implemented**: raw user message persistence precedes optional processing.
 - **Implemented**: recent history is bounded by configuration.
-- **Implemented**: explicit repository inspection language triggers read-only ARA delegation.
-- **Implemented**: completed ARA findings are supplied to the model for synthesis.
-- **Partial**: delegation planning is deterministic keyword matching, not a general typed planner.
+- **Implemented**: the model can call `delegate_ara` for read-only repository inspection.
+- **Implemented**: delegated task completion wakes the paused turn and supplies findings to the
+  model loop.
 - **Partial**: memory processing is best-effort in the request path, not yet a durable background
   queue.
 
@@ -169,6 +169,10 @@ stateDiagram-v2
 An ARA is eligible only when tenant ownership and required capabilities match. Every progress,
 renewal, approval, artifact, and completion operation validates tenant ID, ARA ID, task ID, lease
 ID, task state, and lease expiry within the persistence boundary.
+
+`delegate_ara` creates a task with `file.read:repository`, bounded objective and context, and a
+durable `ToolInvocation.task_id` link. A terminal ARA result marks the invocation terminal and
+returns the owning conversation turn to pending so the coordinator can resume it.
 
 The implemented repository ARA:
 

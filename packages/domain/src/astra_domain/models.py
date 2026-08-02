@@ -48,6 +48,28 @@ class TaskState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class ConversationTurnState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ToolInvocationTarget(StrEnum):
+    LOCAL = "local"
+    ARA = "ara"
+
+
+class ToolInvocationState(StrEnum):
+    PENDING = "pending"
+    AWAITING_APPROVAL = "awaiting_approval"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
+
+
 class ApprovalState(StrEnum):
     PENDING = "pending"
     GRANTED = "granted"
@@ -84,6 +106,15 @@ class EventType(StrEnum):
     TASK_FAILED = "task.failed"
     TASK_CANCELLED = "task.cancelled"
     ARTIFACT_PRODUCED = "artifact.produced"
+    CONVERSATION_TURN_CREATED = "conversation_turn.created"
+    CONVERSATION_TURN_RUNNING = "conversation_turn.running"
+    CONVERSATION_TURN_PAUSED = "conversation_turn.paused"
+    CONVERSATION_TURN_COMPLETED = "conversation_turn.completed"
+    CONVERSATION_TURN_FAILED = "conversation_turn.failed"
+    TOOL_INVOCATION_REQUESTED = "tool_invocation.requested"
+    TOOL_INVOCATION_COMPLETED = "tool_invocation.completed"
+    TOOL_INVOCATION_FAILED = "tool_invocation.failed"
+    TOOL_INVOCATION_DENIED = "tool_invocation.denied"
 
 
 class MemoryKind(StrEnum):
@@ -126,6 +157,43 @@ class ConversationMessage(TenantOwnedModel):
     role: MessageRole
     content: str = Field(min_length=1, max_length=50_000)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ConversationTurn(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    conversation_id: UUID
+    user_message_id: UUID
+    client_request_id: UUID
+    state: ConversationTurnState = ConversationTurnState.PENDING
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+    run_lease_id: UUID | None = None
+    run_lease_expires_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_run_lease(self) -> ConversationTurn:
+        if (self.run_lease_id is None) != (self.run_lease_expires_at is None):
+            raise ValueError("run lease id and expiry must be provided together")
+        if self.run_lease_expires_at is not None and self.run_lease_expires_at.tzinfo is None:
+            raise ValueError("run_lease_expires_at must be timezone-aware")
+        return self
+
+
+class ToolInvocation(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    turn_id: UUID
+    task_id: UUID | None = None
+    tool_call_id: str = Field(min_length=1, max_length=200)
+    tool_name: str = Field(min_length=1, max_length=200)
+    target: ToolInvocationTarget
+    state: ToolInvocationState = ToolInvocationState.PENDING
+    arguments: dict[str, Any]
+    arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
 
 
 class RemoteAgent(TenantOwnedModel):
@@ -175,13 +243,26 @@ class Lease(TenantOwnedModel):
 
 class Approval(TenantOwnedModel):
     id: UUID = Field(default_factory=uuid4)
-    task_id: UUID
+    task_id: UUID | None = None
+    tool_invocation_id: UUID | None = None
     capability: Capability
-    requested_by: UUID
+    requested_by: UUID | None = None
+    requestor_type: ActorType = ActorType.ARA
     state: ApprovalState = ApprovalState.PENDING
     reason: str = Field(min_length=1, max_length=2_000)
     created_at: datetime = Field(default_factory=utc_now)
     decided_at: datetime | None = None
+    decided_by: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_subject_and_requestor(self) -> Approval:
+        if (self.task_id is None) == (self.tool_invocation_id is None):
+            raise ValueError("exactly one of task_id or tool_invocation_id is required")
+        if self.requestor_type not in {ActorType.COORDINATOR, ActorType.ARA}:
+            raise ValueError("requestor_type must be coordinator or ara")
+        if self.requestor_type is ActorType.ARA and self.requested_by is None:
+            raise ValueError("ARA approvals require requested_by")
+        return self
 
 
 class Artifact(TenantOwnedModel):

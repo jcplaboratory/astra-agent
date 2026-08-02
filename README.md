@@ -106,6 +106,20 @@ uv run ara
 The ARA executes no commands and uses no network tools. It reads bounded text files beneath the
 configured root and reports path and line evidence through the lease protocol.
 
+## Tenant Workspaces And Sandbox
+
+Local model tools are disabled unless the tenant has a trusted workspace mapping. Configure each
+tenant with an absolute, existing, non-symlink root and explicit grants in `ASTRA_TENANT_WORKSPACES`:
+
+```json
+{"tenant-uuid":{"root":"/absolute/path/to/workspace","grants":[{"kind":"file.read","scope":"workspace"}]}}
+```
+
+`run_command` additionally requires `command.execute:workspace` and a sandbox configuration. Set
+both `ASTRA_SANDBOX_EXECUTABLE` to an absolute `docker` or `podman` executable and
+`ASTRA_SANDBOX_IMAGE` to the approved image. Commands run with no network, a read-only workspace,
+resource limits, and an approval gate unless policy pre-authorizes the capability.
+
 ## Memory
 
 Local retrieval ranks authorized MariaDB records without extra infrastructure. Set

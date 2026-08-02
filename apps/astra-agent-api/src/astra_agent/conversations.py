@@ -1,20 +1,60 @@
-import asyncio
-from uuid import UUID
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import UUID, uuid4
 
 from astra_domain import (
     ActorType,
+    Approval,
+    ApprovalState,
     AuditEvent,
     Capability,
     CapabilityKind,
     ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     MessageRole,
     Task,
     TaskState,
+    ToolInvocation,
+    ToolInvocationState,
+    ToolInvocationTarget,
 )
 from astra_memory import ContextCompiler, MemoryPipeline
-from astra_model_providers import MainModelProvider, ModelMessage, ModelProviderError
-from astra_runtime import RuntimeStore
+from astra_model_providers import (
+    MainModelProvider,
+    ModelCompletion,
+    ModelMessage,
+    ModelProviderError,
+    ToolCall,
+    ToolDefinition,
+)
+from astra_runtime import LifecycleConflictError, RuntimeStore
+
+from astra_agent.settings import Settings
+from astra_agent.tools import LocalToolRegistry, ToolResult
+
+_RUN_LEASE_DURATION = timedelta(minutes=5)
+_MAX_TOOL_ITERATIONS = 8
+_MAX_TOOL_RESULT_CHARS = 12_000
+_FILE_READ_CAPABILITY = Capability(kind=CapabilityKind.FILE_READ, scope="workspace")
+_ARA_FILE_READ_CAPABILITY = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
+_COMMAND_CAPABILITY = Capability(kind=CapabilityKind.COMMAND_EXECUTE, scope="workspace")
+_ARA_DELEGATE_TOOL = ToolDefinition(
+    name="delegate_ara",
+    description="Delegate bounded read-only repository inspection to an Astra Remote Agent.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "objective": {"type": "string", "minLength": 1},
+            "context": {"type": "string"},
+        },
+        "required": ["objective"],
+        "additionalProperties": False,
+    },
+)
 
 
 class ConversationOrchestrator:
@@ -28,54 +68,389 @@ class ConversationOrchestrator:
         delegation_wait_seconds: float = 30,
         delegation_poll_seconds: float = 0.25,
         delegation_enabled: bool = True,
+        tool_registry: LocalToolRegistry | None = None,
+        max_tool_iterations: int = _MAX_TOOL_ITERATIONS,
     ) -> None:
         self._store = store
         self._compiler = compiler
         self._model_provider = model_provider
         self._history_limit = history_limit
         self._memory_pipeline = memory_pipeline
-        self._delegation_wait_seconds = delegation_wait_seconds
-        self._delegation_poll_seconds = delegation_poll_seconds
         self._delegation_enabled = delegation_enabled
+        # Kept for callers still constructing this class with the former signature.
+        self._tool_registry = tool_registry or LocalToolRegistry(Settings())
+        self._max_tool_iterations = max_tool_iterations
 
-    @staticmethod
-    def should_delegate(content: str) -> bool:
-        lowered = content.casefold()
-        action = any(term in lowered for term in ("inspect", "research", "analyze", "review"))
-        target = any(term in lowered for term in ("repository", "repo", "codebase"))
-        return action and target
-
-    async def _delegate(self, tenant_id: UUID, content: str, context: str) -> Task:
-        capability = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
-        task = Task(
+    async def start_turn(
+        self,
+        tenant_id: UUID,
+        user_id: UUID,
+        conversation_id: UUID,
+        client_request_id: UUID,
+        content: str,
+    ) -> tuple[ConversationMessage, ConversationTurn]:
+        user_message = ConversationMessage(
             tenant_id=tenant_id,
-            objective=content,
-            context=context,
-            required_capabilities=(capability,),
-            deliverable_contract="Repository inventory and evidence-backed findings",
+            conversation_id=conversation_id,
+            role=MessageRole.USER,
+            content=content,
+        )
+        turn = ConversationTurn(
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            user_message_id=user_message.id,
+            client_request_id=client_request_id,
+        )
+        received_event = AuditEvent(
+            tenant_id=tenant_id,
+            event_type=EventType.CONVERSATION_RECEIVED,
+            actor_type=ActorType.USER,
+            actor_id=user_id,
+            payload={"conversation_id": str(conversation_id), "message_id": str(user_message.id)},
+        )
+        created = await self._store.create_turn(
+            user_message,
+            turn,
+            (
+                received_event,
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_CREATED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn.id)},
+                ),
+            ),
+        )
+        if created.id != turn.id:
+            messages = await self._store.list_messages(
+                tenant_id, conversation_id, self._history_limit
+            )
+            existing = next((item for item in messages if item.id == created.user_message_id), None)
+            if existing is None:
+                raise LifecycleConflictError("turn user message is unavailable")
+            return existing, created
+        if self._memory_pipeline is not None:
+            try:
+                await self._memory_pipeline.process_message(
+                    tenant_id, received_event.id, user_message.id, content
+                )
+            except Exception:
+                # Conversation durability must not depend on optional memory processing.
+                pass
+        return user_message, created
+
+    async def advance_one(self, tenant_id: UUID) -> ConversationTurn | None:
+        run_lease_id = uuid4()
+        turn = await self._store.claim_pending_turn(
+            tenant_id, run_lease_id, datetime.now(UTC) + _RUN_LEASE_DURATION
+        )
+        if turn is None:
+            return None
+        return await self.run_turn(turn, run_lease_id)
+
+    async def run_turn(self, turn: ConversationTurn, run_lease_id: UUID) -> ConversationTurn:
+        messages, iterations, pending_calls = await self._messages_for_turn(turn)
+        definitions = self._tool_registry.definitions(turn.tenant_id)
+        if self._delegation_enabled:
+            definitions = (*definitions, _ARA_DELEGATE_TOOL)
+        known_tools = {definition.name for definition in definitions}
+
+        while pending_calls:
+            call, *remaining_calls = pending_calls
+            paused = await self._execute_call(turn, run_lease_id, call, known_tools, messages)
+            if paused is not None:
+                return paused
+            pending_calls = tuple(remaining_calls)
+            turn = await self._checkpoint(turn, run_lease_id, messages, iterations, pending_calls)
+
+        while iterations < self._max_tool_iterations:
+            await self._store.append_event(
+                AuditEvent(
+                    tenant_id=turn.tenant_id,
+                    event_type=EventType.MODEL_REQUEST,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn.id), "message_count": len(messages)},
+                )
+            )
+            try:
+                completion = await self._model_provider.complete(tuple(messages), definitions)
+            except ModelProviderError:
+                await self._store.append_event(
+                    AuditEvent(
+                        tenant_id=turn.tenant_id,
+                        event_type=EventType.MODEL_FAILED,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": str(turn.id)},
+                    )
+                )
+                raise
+            if not isinstance(completion, ModelCompletion):
+                raise TypeError("tool-enabled model completion must return ModelCompletion")
+            await self._store.append_event(
+                AuditEvent(
+                    tenant_id=turn.tenant_id,
+                    event_type=EventType.MODEL_RESPONSE,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={
+                        "turn_id": str(turn.id),
+                        "tool_call_count": len(completion.tool_calls),
+                    },
+                )
+            )
+            if not completion.tool_calls:
+                content = completion.content or "I could not produce a response."
+                return await self._store.complete_turn(
+                    turn.tenant_id,
+                    turn.id,
+                    run_lease_id,
+                    ConversationMessage(
+                        tenant_id=turn.tenant_id,
+                        conversation_id=turn.conversation_id,
+                        role=MessageRole.ASSISTANT,
+                        content=content,
+                    ),
+                )
+
+            messages.append(
+                ModelMessage(
+                    role="system",
+                    content=self._tool_call_summary(completion.tool_calls, completion.content),
+                )
+            )
+            iterations += 1
+            pending_calls = completion.tool_calls
+            turn = await self._checkpoint(turn, run_lease_id, messages, iterations, pending_calls)
+            while pending_calls:
+                call, *remaining_calls = pending_calls
+                paused = await self._execute_call(turn, run_lease_id, call, known_tools, messages)
+                if paused is not None:
+                    return paused
+                pending_calls = tuple(remaining_calls)
+                turn = await self._checkpoint(
+                    turn, run_lease_id, messages, iterations, pending_calls
+                )
+
+        return await self._store.complete_turn(
+            turn.tenant_id,
+            turn.id,
+            run_lease_id,
+            ConversationMessage(
+                tenant_id=turn.tenant_id,
+                conversation_id=turn.conversation_id,
+                role=MessageRole.ASSISTANT,
+                content="I stopped after reaching the tool-call limit.",
+            ),
+        )
+
+    async def _messages_for_turn(
+        self, turn: ConversationTurn
+    ) -> tuple[list[ModelMessage], int, tuple[ToolCall, ...]]:
+        checkpoint_messages = turn.checkpoint.get("messages")
+        if isinstance(checkpoint_messages, list):
+            messages = [ModelMessage.model_validate(item) for item in checkpoint_messages]
+            iterations = turn.checkpoint.get("iterations", 0)
+            if isinstance(iterations, int) and iterations >= 0:
+                pending_calls = turn.checkpoint.get("pending_calls", [])
+                if not isinstance(pending_calls, list):
+                    raise LifecycleConflictError("turn checkpoint has invalid pending calls")
+                return (
+                    messages,
+                    iterations,
+                    tuple(ToolCall.model_validate(item) for item in pending_calls),
+                )
+            raise LifecycleConflictError("turn checkpoint has invalid iteration count")
+
+        history = await self._store.list_messages(
+            turn.tenant_id, turn.conversation_id, self._history_limit
+        )
+        user_message = next((item for item in history if item.id == turn.user_message_id), None)
+        if user_message is None:
+            raise LifecycleConflictError("turn user message is unavailable")
+        briefing = await self._compiler.compile(turn.tenant_id, user_message.content)
+        await self._store.append_event(
+            AuditEvent(
+                tenant_id=turn.tenant_id,
+                event_type=EventType.CONTEXT_COMPILED,
+                actor_type=ActorType.COORDINATOR,
+                payload={
+                    "turn_id": str(turn.id),
+                    "estimated_tokens": briefing.estimated_tokens,
+                    "source_memory_ids": [str(item) for item in briefing.source_memory_ids],
+                },
+            )
+        )
+        return (
+            [
+                ModelMessage(role="system", content=briefing.content),
+                *(ModelMessage(role=item.role.value, content=item.content) for item in history),
+            ],
+            0,
+            (),
+        )
+
+    async def _execute_call(
+        self,
+        turn: ConversationTurn,
+        run_lease_id: UUID,
+        call: ToolCall,
+        known_tools: set[str],
+        messages: list[ModelMessage],
+    ) -> ConversationTurn | None:
+        if call.name == _ARA_DELEGATE_TOOL.name:
+            return await self._delegate_ara(turn, run_lease_id, call, messages)
+        invocation_id = uuid4()
+        invocation = await self._store.create_tool_invocation(
+            ToolInvocation(
+                id=invocation_id,
+                tenant_id=turn.tenant_id,
+                turn_id=turn.id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                target=ToolInvocationTarget.LOCAL,
+                arguments=call.arguments,
+                arguments_sha256=self._arguments_sha256(call.arguments),
+            )
+        )
+        if invocation.state is ToolInvocationState.DENIED:
+            messages.append(self._tool_message(call.name, "Tool use was denied by policy."))
+            return None
+        if call.name not in known_tools:
+            await self._store.fail_tool_invocation(turn.tenant_id, invocation.id)
+            messages.append(self._tool_message(call.name, "Unknown or unavailable local tool."))
+            return None
+
+        approval_state = ApprovalState.GRANTED if invocation.id != invocation_id else None
+        result = await self._tool_registry.dispatch(
+            turn.tenant_id, call.name, call.arguments, approval_state
+        )
+        if result.data.get("requires_approval") is True:
+            await self._store.create_coordinator_approval(
+                Approval(
+                    tenant_id=turn.tenant_id,
+                    tool_invocation_id=invocation.id,
+                    capability=self._capability_for(call.name),
+                    requestor_type=ActorType.COORDINATOR,
+                    reason=result.error or f"Approval required to use {call.name}",
+                )
+            )
+            paused = await self._store.get_turn(turn.tenant_id, turn.id)
+            if paused is None:
+                raise LifecycleConflictError("paused turn is unavailable")
+            return paused
+        if result.success:
+            await self._store.complete_tool_invocation(turn.tenant_id, invocation.id)
+            tool_content = self._bounded_result(result)
+        else:
+            await self._store.fail_tool_invocation(turn.tenant_id, invocation.id)
+            tool_content = "The tool request was denied or could not be completed."
+        messages.append(self._tool_message(call.name, tool_content))
+        return None
+
+    async def _delegate_ara(
+        self,
+        turn: ConversationTurn,
+        run_lease_id: UUID,
+        call: ToolCall,
+        messages: list[ModelMessage],
+    ) -> ConversationTurn | None:
+        objective = call.arguments.get("objective")
+        context = call.arguments.get("context", "")
+        if not isinstance(objective, str) or not objective or not isinstance(context, str):
+            messages.append(self._tool_message(call.name, "Invalid delegation arguments."))
+            return None
+        existing_invocation = await self._store.get_tool_invocation(
+            turn.tenant_id, turn.id, call.id
+        )
+        if existing_invocation is not None:
+            if existing_invocation.task_id is None:
+                raise LifecycleConflictError("delegation invocation has no task")
+            existing = await self._store.get_task(turn.tenant_id, existing_invocation.task_id)
+            if existing is None:
+                raise LifecycleConflictError("delegated task is unavailable")
+            if existing.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+                messages.append(self._tool_message(call.name, self._bounded_task_result(existing)))
+                return None
+            return await self._store.pause_turn(
+                turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
+            )
+        task = Task(
+            tenant_id=turn.tenant_id,
+            objective=objective[:10_000],
+            context=context[:12_000],
+            required_capabilities=(_ARA_FILE_READ_CAPABILITY,),
+            deliverable_contract="Return bounded repository findings with file and line evidence.",
         )
         await self._store.add_task(
             task,
             AuditEvent(
-                tenant_id=tenant_id,
+                tenant_id=turn.tenant_id,
                 event_type=EventType.TASK_CREATED,
                 actor_type=ActorType.COORDINATOR,
                 task_id=task.id,
-                payload={"delegation_reason": "explicit repository inspection request"},
+                payload={"turn_id": str(turn.id)},
             ),
         )
-        deadline = asyncio.get_running_loop().time() + self._delegation_wait_seconds
-        while asyncio.get_running_loop().time() < deadline:
-            current = await self._store.get_task(tenant_id, task.id)
-            if current is not None and current.state in {
-                TaskState.COMPLETED,
-                TaskState.FAILED,
-                TaskState.CANCELLED,
-            }:
-                return current
-            await asyncio.sleep(self._delegation_poll_seconds)
-        current = await self._store.get_task(tenant_id, task.id)
-        return current or task
+        await self._store.create_tool_invocation(
+            ToolInvocation(
+                tenant_id=turn.tenant_id,
+                turn_id=turn.id,
+                task_id=task.id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                target=ToolInvocationTarget.ARA,
+                arguments=call.arguments,
+                arguments_sha256=self._arguments_sha256(call.arguments),
+            )
+        )
+        return await self._store.pause_turn(turn.tenant_id, turn.id, run_lease_id, turn.checkpoint)
+
+    async def _checkpoint(
+        self,
+        turn: ConversationTurn,
+        run_lease_id: UUID,
+        messages: list[ModelMessage],
+        iterations: int,
+        pending_calls: tuple[ToolCall, ...],
+    ) -> ConversationTurn:
+        return await self._store.checkpoint_turn(
+            turn.tenant_id,
+            turn.id,
+            run_lease_id,
+            {
+                "messages": [message.model_dump() for message in messages],
+                "iterations": iterations,
+                "pending_calls": [call.model_dump() for call in pending_calls],
+            },
+        )
+
+    @staticmethod
+    def _arguments_sha256(arguments: dict[str, Any]) -> str:
+        encoded = json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(encoded.encode()).hexdigest()
+
+    @staticmethod
+    def _tool_call_summary(calls: tuple[ToolCall, ...], content: str | None) -> str:
+        prefix = content or "The model requested local tools."
+        return f"{prefix}\nTool calls: " + ", ".join(call.name for call in calls)
+
+    @staticmethod
+    def _tool_message(name: str, content: str) -> ModelMessage:
+        return ModelMessage(role="system", content=f"Tool result for {name}:\n{content}")
+
+    @staticmethod
+    def _bounded_result(result: ToolResult) -> str:
+        payload = json.dumps(result.model_dump(), sort_keys=True, ensure_ascii=True)
+        return payload[:_MAX_TOOL_RESULT_CHARS]
+
+    @staticmethod
+    def _bounded_task_result(task: Task) -> str:
+        return (task.result or "ARA completed without findings.")[:_MAX_TOOL_RESULT_CHARS]
+
+    @staticmethod
+    def _capability_for(name: str) -> Capability:
+        if name == "run_command":
+            return _COMMAND_CAPABILITY
+        return _FILE_READ_CAPABILITY
 
     async def respond(
         self,
@@ -84,118 +459,21 @@ class ConversationOrchestrator:
         conversation_id: UUID,
         content: str,
     ) -> tuple[ConversationMessage, ConversationMessage]:
-        user_message = ConversationMessage(
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            role=MessageRole.USER,
-            content=content,
+        user_message, turn = await self.start_turn(
+            tenant_id, user_id, conversation_id, uuid4(), content
         )
-        received_event = AuditEvent(
-            tenant_id=tenant_id,
-            event_type=EventType.CONVERSATION_RECEIVED,
-            actor_type=ActorType.USER,
-            actor_id=user_id,
-            payload={
-                "conversation_id": str(conversation_id),
-                "message_id": str(user_message.id),
-            },
+        while turn.state not in {ConversationTurnState.COMPLETED, ConversationTurnState.PAUSED}:
+            await self.advance_one(tenant_id)
+            refreshed = await self._store.get_turn(tenant_id, turn.id)
+            if refreshed is None:
+                raise LifecycleConflictError("turn is unavailable")
+            turn = refreshed
+        if turn.state is ConversationTurnState.PAUSED:
+            raise LifecycleConflictError("turn is awaiting approval")
+        messages = await self._store.list_messages(tenant_id, conversation_id, self._history_limit)
+        assistant_message = next(
+            (item for item in reversed(messages) if item.role is MessageRole.ASSISTANT), None
         )
-        await self._store.append_message(
-            user_message,
-            (received_event,),
-        )
-        if self._memory_pipeline is not None:
-            try:
-                await self._memory_pipeline.process_message(
-                    tenant_id, received_event.id, user_message.id, content
-                )
-            except Exception:
-                # Raw conversation persistence must not depend on optional memory processing.
-                pass
-        briefing = await self._compiler.compile(tenant_id, content)
-        await self._store.append_event(
-            AuditEvent(
-                tenant_id=tenant_id,
-                event_type=EventType.CONTEXT_COMPILED,
-                actor_type=ActorType.COORDINATOR,
-                payload={
-                    "conversation_id": str(conversation_id),
-                    "estimated_tokens": briefing.estimated_tokens,
-                    "source_memory_ids": [str(item) for item in briefing.source_memory_ids],
-                },
-            )
-        )
-        history = await self._store.list_messages(tenant_id, conversation_id, self._history_limit)
-        model_messages = (
-            ModelMessage(role="system", content=briefing.content),
-            *(ModelMessage(role=item.role.value, content=item.content) for item in history),
-        )
-        if self._delegation_enabled and self.should_delegate(content):
-            delegated = await self._delegate(tenant_id, content, briefing.content)
-            if delegated.state is TaskState.COMPLETED and delegated.result:
-                model_messages = (
-                    *model_messages,
-                    ModelMessage(
-                        role="system",
-                        content=(
-                            "ARA findings follow. Synthesize them into a direct answer, "
-                            "cite file paths and line evidence, and do not invent details.\n\n"
-                            f"{delegated.result}"
-                        ),
-                    ),
-                )
-            else:
-                model_messages = (
-                    *model_messages,
-                    ModelMessage(
-                        role="system",
-                        content=(
-                            f"Repository task {delegated.id} is {delegated.state.value}. "
-                            "Tell the user it is delegated and visible in task progress."
-                        ),
-                    ),
-                )
-        await self._store.append_event(
-            AuditEvent(
-                tenant_id=tenant_id,
-                event_type=EventType.MODEL_REQUEST,
-                actor_type=ActorType.COORDINATOR,
-                payload={
-                    "conversation_id": str(conversation_id),
-                    "message_count": len(model_messages),
-                },
-            )
-        )
-        try:
-            response = await self._model_provider.complete(model_messages)
-        except ModelProviderError:
-            await self._store.append_event(
-                AuditEvent(
-                    tenant_id=tenant_id,
-                    event_type=EventType.MODEL_FAILED,
-                    actor_type=ActorType.COORDINATOR,
-                    payload={"conversation_id": str(conversation_id)},
-                )
-            )
-            raise
-        assistant_message = ConversationMessage(
-            tenant_id=tenant_id,
-            conversation_id=conversation_id,
-            role=MessageRole.ASSISTANT,
-            content=response,
-        )
-        await self._store.append_message(
-            assistant_message,
-            (
-                AuditEvent(
-                    tenant_id=tenant_id,
-                    event_type=EventType.MODEL_RESPONSE,
-                    actor_type=ActorType.COORDINATOR,
-                    payload={
-                        "conversation_id": str(conversation_id),
-                        "message_id": str(assistant_message.id),
-                    },
-                ),
-            ),
-        )
+        if assistant_message is None:
+            raise LifecycleConflictError("completed turn has no assistant message")
         return user_message, assistant_message

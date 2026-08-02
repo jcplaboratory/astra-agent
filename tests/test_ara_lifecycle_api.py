@@ -137,7 +137,7 @@ def test_ara_lifecycle_and_approval() -> None:
                 headers=user_headers,
                 json={"tenant_id": str(tenant_id), "granted": True},
             ).status_code
-            == 409
+            == 200
         )
 
         completion = client.post(

@@ -10,6 +10,7 @@ dependencies = [
   "astra-model-providers",
   "astra-protocol",
   "astra-runtime",
+  "astra-policy",
   "fastapi>=0.115",
   "httpx>=0.28",
   "pyjwt[crypto]>=2.10",
@@ -26,6 +27,7 @@ astra-memory = { workspace = true }
 astra-model-providers = { workspace = true }
 astra-protocol = { workspace = true }
 astra-runtime = { workspace = true }
+astra-policy = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

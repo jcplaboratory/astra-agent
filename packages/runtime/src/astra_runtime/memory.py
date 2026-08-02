@@ -1,5 +1,6 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 from astra_domain import (
@@ -10,13 +11,18 @@ from astra_domain import (
     AuditEvent,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     Lease,
     MemoryRecord,
     MemoryState,
+    MessageRole,
     RemoteAgent,
     Task,
     TaskState,
+    ToolInvocation,
+    ToolInvocationState,
 )
 from astra_policy import evaluate_capability
 
@@ -28,6 +34,8 @@ class InMemoryRuntimeStore:
         self._remote_agents: dict[UUID, RemoteAgent] = {}
         self._conversations: dict[UUID, Conversation] = {}
         self._messages: dict[UUID, ConversationMessage] = {}
+        self._turns: dict[UUID, ConversationTurn] = {}
+        self._tool_invocations: dict[UUID, ToolInvocation] = {}
         self._memories: dict[UUID, MemoryRecord] = {}
         self._tasks: dict[UUID, Task] = {}
         self._leases: dict[UUID, Lease] = {}
@@ -224,6 +232,325 @@ class InMemoryRuntimeStore:
             )
             return tuple(messages[-limit:])
 
+    async def create_turn(
+        self,
+        user_message: ConversationMessage,
+        turn: ConversationTurn,
+        events: tuple[AuditEvent, ...],
+    ) -> ConversationTurn:
+        async with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in self._turns.values()
+                    if item.tenant_id == turn.tenant_id
+                    and item.client_request_id == turn.client_request_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            conversation = self._conversations.get(turn.conversation_id)
+            if (
+                conversation is None
+                or conversation.tenant_id != turn.tenant_id
+                or user_message.tenant_id != turn.tenant_id
+                or user_message.conversation_id != turn.conversation_id
+                or user_message.id != turn.user_message_id
+                or user_message.role is not MessageRole.USER
+            ):
+                raise LifecycleNotFoundError("conversation not found")
+            self._messages[user_message.id] = user_message
+            self._turns[turn.id] = turn
+            self._conversations[conversation.id] = conversation.model_copy(
+                update={"updated_at": user_message.created_at}
+            )
+            self._events.extend(events)
+            return turn
+
+    async def get_turn(self, tenant_id: UUID, turn_id: UUID) -> ConversationTurn | None:
+        async with self._lock:
+            turn = self._turns.get(turn_id)
+            return turn if turn is not None and turn.tenant_id == tenant_id else None
+
+    async def list_conversation_turns(
+        self, tenant_id: UUID, conversation_id: UUID
+    ) -> tuple[ConversationTurn, ...]:
+        async with self._lock:
+            return tuple(
+                item
+                for item in sorted(self._turns.values(), key=lambda item: item.created_at)
+                if item.tenant_id == tenant_id and item.conversation_id == conversation_id
+            )
+
+    @staticmethod
+    def _validate_run_lease_expiry(expires_at: datetime) -> None:
+        now = datetime.now(UTC)
+        if expires_at <= now or expires_at > now.replace(microsecond=0) + timedelta(minutes=15):
+            raise LifecycleConflictError("run lease must expire within 15 minutes")
+
+    def _active_turn(self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID) -> ConversationTurn:
+        turn = self._turns.get(turn_id)
+        if turn is None or turn.tenant_id != tenant_id:
+            raise LifecycleNotFoundError("turn not found")
+        if (
+            turn.state is not ConversationTurnState.RUNNING
+            or turn.run_lease_id != run_lease_id
+            or turn.run_lease_expires_at is None
+            or turn.run_lease_expires_at <= datetime.now(UTC)
+        ):
+            raise LifecycleConflictError("turn is not actively claimed")
+        return turn
+
+    async def claim_pending_turn(
+        self, tenant_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None:
+        self._validate_run_lease_expiry(run_lease_expires_at)
+        async with self._lock:
+            now = datetime.now(UTC)
+            turn = next(
+                (
+                    item
+                    for item in sorted(self._turns.values(), key=lambda item: item.created_at)
+                    if item.tenant_id == tenant_id
+                    and (
+                        item.state is ConversationTurnState.PENDING
+                        or (
+                            item.state is ConversationTurnState.RUNNING
+                            and item.run_lease_expires_at is not None
+                            and item.run_lease_expires_at <= now
+                        )
+                    )
+                ),
+                None,
+            )
+            if turn is None:
+                return None
+            claimed = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.RUNNING,
+                    "run_lease_id": run_lease_id,
+                    "run_lease_expires_at": run_lease_expires_at,
+                    "updated_at": now,
+                }
+            )
+            self._turns[turn.id] = claimed
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_RUNNING,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn.id)},
+                )
+            )
+            return claimed
+
+    async def checkpoint_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
+    ) -> ConversationTurn:
+        async with self._lock:
+            turn = self._active_turn(tenant_id, turn_id, run_lease_id)
+            updated = turn.model_copy(
+                update={"checkpoint": checkpoint, "updated_at": datetime.now(UTC)}
+            )
+            self._turns[turn_id] = updated
+            return updated
+
+    async def pause_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
+    ) -> ConversationTurn:
+        async with self._lock:
+            turn = self._active_turn(tenant_id, turn_id, run_lease_id)
+            paused = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.PAUSED,
+                    "checkpoint": checkpoint,
+                    "run_lease_id": None,
+                    "run_lease_expires_at": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._turns[turn_id] = paused
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_PAUSED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn_id)},
+                )
+            )
+            return paused
+
+    async def create_tool_invocation(self, invocation: ToolInvocation) -> ToolInvocation:
+        async with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in self._tool_invocations.values()
+                    if item.turn_id == invocation.turn_id
+                    and item.tool_call_id == invocation.tool_call_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            turn = self._turns.get(invocation.turn_id)
+            if turn is None or turn.tenant_id != invocation.tenant_id:
+                raise LifecycleNotFoundError("turn not found")
+            self._tool_invocations[invocation.id] = invocation
+            self._events.append(
+                AuditEvent(
+                    tenant_id=invocation.tenant_id,
+                    event_type=EventType.TOOL_INVOCATION_REQUESTED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"invocation_id": str(invocation.id)},
+                )
+            )
+            return invocation
+
+    async def get_tool_invocation(
+        self, tenant_id: UUID, turn_id: UUID, tool_call_id: str
+    ) -> ToolInvocation | None:
+        async with self._lock:
+            return next(
+                (
+                    item
+                    for item in self._tool_invocations.values()
+                    if item.tenant_id == tenant_id
+                    and item.turn_id == turn_id
+                    and item.tool_call_id == tool_call_id
+                ),
+                None,
+            )
+
+    async def _finish_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID, state: ToolInvocationState
+    ) -> ToolInvocation:
+        async with self._lock:
+            invocation = self._tool_invocations.get(invocation_id)
+            if invocation is None or invocation.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("tool invocation not found")
+            if invocation.state in {
+                ToolInvocationState.COMPLETED,
+                ToolInvocationState.FAILED,
+                ToolInvocationState.DENIED,
+            }:
+                if invocation.state is state:
+                    return invocation
+                raise LifecycleConflictError("tool invocation is already finished")
+            completed = invocation.model_copy(
+                update={
+                    "state": state,
+                    "updated_at": datetime.now(UTC),
+                    "completed_at": datetime.now(UTC),
+                }
+            )
+            self._tool_invocations[invocation_id] = completed
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.TOOL_INVOCATION_COMPLETED
+                    if state is ToolInvocationState.COMPLETED
+                    else EventType.TOOL_INVOCATION_FAILED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"invocation_id": str(invocation_id)},
+                )
+            )
+            return completed
+
+    async def complete_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID
+    ) -> ToolInvocation:
+        return await self._finish_tool_invocation(
+            tenant_id, invocation_id, ToolInvocationState.COMPLETED
+        )
+
+    async def fail_tool_invocation(self, tenant_id: UUID, invocation_id: UUID) -> ToolInvocation:
+        return await self._finish_tool_invocation(
+            tenant_id, invocation_id, ToolInvocationState.FAILED
+        )
+
+    async def create_coordinator_approval(self, approval: Approval) -> Approval:
+        async with self._lock:
+            if (
+                approval.requestor_type is not ActorType.COORDINATOR
+                or approval.tool_invocation_id is None
+            ):
+                raise LifecycleConflictError(
+                    "coordinator approval must reference a tool invocation"
+                )
+            invocation = self._tool_invocations.get(approval.tool_invocation_id)
+            if invocation is None or invocation.tenant_id != approval.tenant_id:
+                raise LifecycleNotFoundError("tool invocation not found")
+            if invocation.state is not ToolInvocationState.PENDING:
+                raise LifecycleConflictError("tool invocation cannot await approval")
+            turn = self._turns[invocation.turn_id]
+            self._approvals[approval.id] = approval
+            self._tool_invocations[invocation.id] = invocation.model_copy(
+                update={
+                    "state": ToolInvocationState.AWAITING_APPROVAL,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._turns[turn.id] = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.PAUSED,
+                    "run_lease_id": None,
+                    "run_lease_expires_at": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._events.append(
+                AuditEvent(
+                    tenant_id=approval.tenant_id,
+                    event_type=EventType.APPROVAL_REQUESTED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"approval_id": str(approval.id)},
+                )
+            )
+            return approval
+
+    async def complete_turn(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        assistant_message: ConversationMessage,
+    ) -> ConversationTurn:
+        async with self._lock:
+            turn = self._active_turn(tenant_id, turn_id, run_lease_id)
+            if (
+                assistant_message.tenant_id != tenant_id
+                or assistant_message.conversation_id != turn.conversation_id
+                or assistant_message.role is not MessageRole.ASSISTANT
+            ):
+                raise LifecycleConflictError("assistant message ownership mismatch")
+            now = datetime.now(UTC)
+            completed = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.COMPLETED,
+                    "run_lease_id": None,
+                    "run_lease_expires_at": None,
+                    "updated_at": now,
+                    "completed_at": now,
+                }
+            )
+            self._turns[turn_id] = completed
+            self._messages[assistant_message.id] = assistant_message
+            conversation = self._conversations[turn.conversation_id]
+            self._conversations[conversation.id] = conversation.model_copy(
+                update={"updated_at": assistant_message.created_at}
+            )
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_COMPLETED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn_id)},
+                )
+            )
+            return completed
+
     async def register_ara(self, remote_agent: RemoteAgent, event: AuditEvent) -> RemoteAgent:
         async with self._lock:
             self._remote_agents[remote_agent.id] = remote_agent
@@ -385,6 +712,26 @@ class InMemoryRuntimeStore:
                 update={"state": state, "result": detail, "completed_at": datetime.now(UTC)}
             )
             self._tasks[task_id] = finished
+            invocation = next(
+                (item for item in self._tool_invocations.values() if item.task_id == task_id), None
+            )
+            if invocation is not None:
+                invocation_state = (
+                    ToolInvocationState.COMPLETED
+                    if state is TaskState.COMPLETED
+                    else ToolInvocationState.FAILED
+                )
+                self._tool_invocations[invocation.id] = invocation.model_copy(
+                    update={
+                        "state": invocation_state,
+                        "updated_at": datetime.now(UTC),
+                        "completed_at": datetime.now(UTC),
+                    }
+                )
+                turn = self._turns[invocation.turn_id]
+                self._turns[turn.id] = turn.model_copy(
+                    update={"state": ConversationTurnState.PENDING, "updated_at": datetime.now(UTC)}
+                )
             event_type = {
                 TaskState.COMPLETED: EventType.TASK_COMPLETED,
                 TaskState.FAILED: EventType.TASK_FAILED,
@@ -427,7 +774,12 @@ class InMemoryRuntimeStore:
     ) -> Approval:
         async with self._lock:
             task, _ = self._active_lease(tenant_id, ara_id, task_id, lease_id)
-            if approval.tenant_id != tenant_id or approval.task_id != task.id:
+            if (
+                approval.tenant_id != tenant_id
+                or approval.task_id != task.id
+                or approval.requested_by != ara_id
+                or approval.requestor_type is not ActorType.ARA
+            ):
                 raise LifecycleConflictError("approval ownership mismatch")
             if approval.capability not in task.required_capabilities:
                 raise LifecycleConflictError("capability is not part of the task")
@@ -451,14 +803,50 @@ class InMemoryRuntimeStore:
         state: ApprovalState,
         actor_id: UUID,
     ) -> Approval:
+        if state not in {ApprovalState.GRANTED, ApprovalState.DENIED}:
+            raise LifecycleConflictError("invalid approval decision")
         async with self._lock:
             approval = self._approvals.get(approval_id)
             if approval is None or approval.tenant_id != tenant_id:
                 raise LifecycleNotFoundError("approval not found")
+            if approval.state is state:
+                return approval
             if approval.state is not ApprovalState.PENDING:
                 raise LifecycleConflictError("approval is already decided")
-            decided = approval.model_copy(update={"state": state, "decided_at": datetime.now(UTC)})
+            decided = approval.model_copy(
+                update={"state": state, "decided_at": datetime.now(UTC), "decided_by": actor_id}
+            )
             self._approvals[approval_id] = decided
+            if approval.tool_invocation_id is not None:
+                invocation = self._tool_invocations[approval.tool_invocation_id]
+                invocation_state = (
+                    ToolInvocationState.PENDING
+                    if state is ApprovalState.GRANTED
+                    else ToolInvocationState.DENIED
+                )
+                self._tool_invocations[invocation.id] = invocation.model_copy(
+                    update={
+                        "state": invocation_state,
+                        "updated_at": datetime.now(UTC),
+                        "completed_at": datetime.now(UTC)
+                        if invocation_state is ToolInvocationState.DENIED
+                        else None,
+                    }
+                )
+                turn = self._turns[invocation.turn_id]
+                self._turns[turn.id] = turn.model_copy(
+                    update={"state": ConversationTurnState.PENDING, "updated_at": datetime.now(UTC)}
+                )
+                if state is ApprovalState.DENIED:
+                    self._events.append(
+                        AuditEvent(
+                            tenant_id=tenant_id,
+                            event_type=EventType.TOOL_INVOCATION_DENIED,
+                            actor_type=ActorType.USER,
+                            actor_id=actor_id,
+                            payload={"invocation_id": str(invocation.id)},
+                        )
+                    )
             event_type = (
                 EventType.APPROVAL_GRANTED
                 if state is ApprovalState.GRANTED

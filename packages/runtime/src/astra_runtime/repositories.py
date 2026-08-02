@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from astra_domain import (
@@ -9,11 +9,13 @@ from astra_domain import (
     AuditEvent,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
     Lease,
     MemoryRecord,
     RemoteAgent,
     Task,
     TaskState,
+    ToolInvocation,
 )
 
 
@@ -70,6 +72,55 @@ class RuntimeStore(Protocol):
     async def list_messages(
         self, tenant_id: UUID, conversation_id: UUID, limit: int = 50
     ) -> tuple[ConversationMessage, ...]: ...
+
+    async def create_turn(
+        self,
+        user_message: ConversationMessage,
+        turn: ConversationTurn,
+        events: tuple[AuditEvent, ...],
+    ) -> ConversationTurn: ...
+
+    async def get_turn(self, tenant_id: UUID, turn_id: UUID) -> ConversationTurn | None: ...
+
+    async def list_conversation_turns(
+        self, tenant_id: UUID, conversation_id: UUID
+    ) -> tuple[ConversationTurn, ...]: ...
+
+    async def claim_pending_turn(
+        self, tenant_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None: ...
+
+    async def checkpoint_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
+    ) -> ConversationTurn: ...
+
+    async def pause_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
+    ) -> ConversationTurn: ...
+
+    async def create_tool_invocation(self, invocation: ToolInvocation) -> ToolInvocation: ...
+
+    async def get_tool_invocation(
+        self, tenant_id: UUID, turn_id: UUID, tool_call_id: str
+    ) -> ToolInvocation | None: ...
+
+    async def complete_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID
+    ) -> ToolInvocation: ...
+
+    async def fail_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID
+    ) -> ToolInvocation: ...
+
+    async def create_coordinator_approval(self, approval: Approval) -> Approval: ...
+
+    async def complete_turn(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        assistant_message: ConversationMessage,
+    ) -> ConversationTurn: ...
 
     async def register_ara(self, remote_agent: RemoteAgent, event: AuditEvent) -> RemoteAgent: ...
 

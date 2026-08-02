@@ -3,12 +3,20 @@ from uuid import uuid4
 import httpx
 from astra_agent import create_app
 from astra_memory import BoundedContextCompiler
-from astra_model_providers import ModelMessage, ModelProviderError, OpenRouterModelProvider
+from astra_model_providers import (
+    ModelCompletion,
+    ModelMessage,
+    ModelProviderError,
+    OpenRouterModelProvider,
+    ToolDefinition,
+)
 from fastapi.testclient import TestClient
 
 
 class FailingModelProvider:
-    async def complete(self, messages: tuple[ModelMessage, ...]) -> str:
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
+    ) -> ModelCompletion:
         raise ModelProviderError("failed")
 
     async def close(self) -> None:
@@ -33,7 +41,11 @@ def test_conversation_turn_is_durable_and_tenant_scoped() -> None:
         turn = client.post(
             f"/api/v1/conversations/{conversation_id}/messages",
             headers=headers,
-            json={"tenant_id": str(tenant_id), "content": "Hello agent"},
+            json={
+                "tenant_id": str(tenant_id),
+                "client_request_id": str(uuid4()),
+                "content": "Hello agent",
+            },
         )
         assert turn.status_code == 200
         assert turn.json()["assistant_message"]["content"] == (
@@ -66,7 +78,11 @@ def test_user_message_survives_model_failure() -> None:
         response = client.post(
             f"/api/v1/conversations/{conversation_id}/messages",
             headers=headers,
-            json={"tenant_id": str(tenant_id), "content": "Keep this"},
+            json={
+                "tenant_id": str(tenant_id),
+                "client_request_id": str(uuid4()),
+                "content": "Keep this",
+            },
         )
         assert response.status_code == 502
         loaded = client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
@@ -89,6 +105,16 @@ async def test_openrouter_adapter_sends_provider_neutral_messages() -> None:
         assert payload == {
             "model": "test/model",
             "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
         }
         return httpx.Response(200, json={"choices": [{"message": {"content": "reply"}}]})
 
@@ -98,6 +124,13 @@ async def test_openrouter_adapter_sends_provider_neutral_messages() -> None:
         headers={"Authorization": "Bearer secret"},
     )
     provider = OpenRouterModelProvider("secret", "test/model", client=client)
-    response = await provider.complete((ModelMessage(role="user", content="hello"),))
-    assert response == "reply"
+    response = await provider.complete(
+        (ModelMessage(role="user", content="hello"),),
+        (
+            ToolDefinition(
+                name="read_file", description="Read a file", parameters={"type": "object"}
+            ),
+        ),
+    )
+    assert response == ModelCompletion(content="reply")
     await client.aclose()

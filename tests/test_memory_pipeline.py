@@ -4,7 +4,7 @@ import httpx
 from astra_agent import create_app
 from astra_domain import MemoryRecord, MemoryState
 from astra_memory import MemoryContextCompiler, NullVectorIndex, QdrantVectorIndex
-from astra_model_providers import ModelMessage
+from astra_model_providers import ModelCompletion, ModelMessage, ToolDefinition
 from astra_runtime import InMemoryRuntimeStore
 from fastapi.testclient import TestClient
 
@@ -13,9 +13,11 @@ class CapturingModelProvider:
     def __init__(self) -> None:
         self.requests: list[tuple[ModelMessage, ...]] = []
 
-    async def complete(self, messages: tuple[ModelMessage, ...]) -> str:
+    async def complete(
+        self, messages: tuple[ModelMessage, ...], _tools: tuple[ToolDefinition, ...]
+    ) -> ModelCompletion:
         self.requests.append(messages)
-        return "captured"
+        return ModelCompletion(content="captured")
 
     async def close(self) -> None:
         return None
@@ -55,7 +57,11 @@ def test_memory_is_extracted_recalled_deduplicated_and_deleted() -> None:
             client.post(
                 path,
                 headers=headers,
-                json={"tenant_id": str(tenant_id), "content": "I prefer concise answers."},
+                json={
+                    "tenant_id": str(tenant_id),
+                    "content": "I prefer concise answers.",
+                    "client_request_id": str(uuid4()),
+                },
             ).status_code
             == 200
         )
@@ -63,7 +69,11 @@ def test_memory_is_extracted_recalled_deduplicated_and_deleted() -> None:
             client.post(
                 path,
                 headers=headers,
-                json={"tenant_id": str(tenant_id), "content": "I prefer concise answers."},
+                json={
+                    "tenant_id": str(tenant_id),
+                    "content": "I prefer concise answers.",
+                    "client_request_id": str(uuid4()),
+                },
             ).status_code
             == 200
         )
@@ -71,7 +81,11 @@ def test_memory_is_extracted_recalled_deduplicated_and_deleted() -> None:
             client.post(
                 path,
                 headers=headers,
-                json={"tenant_id": str(tenant_id), "content": "How should you respond?"},
+                json={
+                    "tenant_id": str(tenant_id),
+                    "content": "How should you respond?",
+                    "client_request_id": str(uuid4()),
+                },
             ).status_code
             == 200
         )
@@ -109,6 +123,7 @@ def test_candidate_memory_is_inspectable_but_not_recalled() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "I use a private experimental tool.",
+                "client_request_id": str(uuid4()),
             },
         )
         client.post(
@@ -117,6 +132,7 @@ def test_candidate_memory_is_inspectable_but_not_recalled() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "What tools do I use?",
+                "client_request_id": str(uuid4()),
             },
         )
         assert "experimental tool" not in model.requests[-1][0].content
@@ -142,6 +158,7 @@ def test_candidate_can_be_promoted_or_rejected() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "I use candidate one.",
+                "client_request_id": str(uuid4()),
             },
         )
         client.post(
@@ -150,6 +167,7 @@ def test_candidate_can_be_promoted_or_rejected() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "I use candidate two.",
+                "client_request_id": str(uuid4()),
             },
         )
         memories = client.get(f"/api/v1/tenants/{tenant_id}/memories", headers=headers).json()[
@@ -194,6 +212,7 @@ def test_candidate_can_replace_promoted_memory() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "I prefer old preference.",
+                "client_request_id": str(uuid4()),
             },
         )
         client.post(
@@ -202,6 +221,7 @@ def test_candidate_can_replace_promoted_memory() -> None:
             json={
                 "tenant_id": str(tenant_id),
                 "content": "I use new preference.",
+                "client_request_id": str(uuid4()),
             },
         )
         memories = client.get(f"/api/v1/tenants/{tenant_id}/memories", headers=headers).json()[

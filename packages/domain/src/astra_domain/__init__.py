@@ -8,6 +8,8 @@ from astra_domain.models import (
     CapabilityKind,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     Lease,
     MemoryKind,
@@ -20,6 +22,9 @@ from astra_domain.models import (
     Task,
     TaskState,
     Tenant,
+    ToolInvocation,
+    ToolInvocationState,
+    ToolInvocationTarget,
 )
 
 __all__ = [
@@ -32,6 +37,8 @@ __all__ = [
     "CapabilityKind",
     "Conversation",
     "ConversationMessage",
+    "ConversationTurn",
+    "ConversationTurnState",
     "EventType",
     "Lease",
     "MemoryKind",
@@ -42,6 +49,9 @@ __all__ = [
     "Task",
     "TaskState",
     "Tenant",
+    "ToolInvocation",
+    "ToolInvocationState",
+    "ToolInvocationTarget",
     "RemoteAgent",
     "RemoteAgentStatus",
 ]

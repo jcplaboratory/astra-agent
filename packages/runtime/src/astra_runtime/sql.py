@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
@@ -11,6 +11,8 @@ from astra_domain import (
     Capability,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     Lease,
     MemoryKind,
@@ -21,6 +23,9 @@ from astra_domain import (
     RemoteAgentStatus,
     Task,
     TaskState,
+    ToolInvocation,
+    ToolInvocationState,
+    ToolInvocationTarget,
 )
 from astra_policy import evaluate_capability
 from sqlalchemy import (
@@ -84,6 +89,47 @@ class ConversationMessageRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
+class ConversationTurnRow(Base):
+    __tablename__ = "conversation_turns"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "client_request_id", name="uq_turns_tenant_request"),
+    )
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    conversation_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("conversations.id"), index=True
+    )
+    user_message_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("conversation_messages.id"))
+    client_request_id: Mapped[str] = mapped_column(CHAR(36))
+    state: Mapped[ConversationTurnState] = mapped_column(Enum(ConversationTurnState), index=True)
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON)
+    run_lease_id: Mapped[str | None] = mapped_column(CHAR(36), index=True)
+    run_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class ToolInvocationRow(Base):
+    __tablename__ = "tool_invocations"
+    __table_args__ = (UniqueConstraint("turn_id", "tool_call_id", name="uq_invocations_turn_call"),)
+    id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(CHAR(36), index=True)
+    turn_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("conversation_turns.id"), index=True)
+    task_id: Mapped[str | None] = mapped_column(CHAR(36), ForeignKey("tasks.id"), index=True)
+    tool_call_id: Mapped[str] = mapped_column(String(200))
+    tool_name: Mapped[str] = mapped_column(String(200))
+    target: Mapped[ToolInvocationTarget] = mapped_column(Enum(ToolInvocationTarget), index=True)
+    state: Mapped[ToolInvocationState] = mapped_column(Enum(ToolInvocationState), index=True)
+    arguments: Mapped[dict[str, Any]] = mapped_column(JSON)
+    arguments_sha256: Mapped[str] = mapped_column(CHAR(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class MemoryRecordRow(Base):
     __tablename__ = "memory_records"
     __table_args__ = (
@@ -145,13 +191,18 @@ class ApprovalRow(Base):
     __tablename__ = "approvals"
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(CHAR(36), index=True)
-    task_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("tasks.id"), index=True)
+    task_id: Mapped[str | None] = mapped_column(CHAR(36), ForeignKey("tasks.id"), index=True)
+    tool_invocation_id: Mapped[str | None] = mapped_column(
+        CHAR(36), ForeignKey("tool_invocations.id"), index=True
+    )
     capability: Mapped[dict[str, Any]] = mapped_column(JSON)
-    requested_by: Mapped[str] = mapped_column(CHAR(36), ForeignKey("remote_agents.id"))
+    requested_by: Mapped[str | None] = mapped_column(CHAR(36), ForeignKey("remote_agents.id"))
+    requestor_type: Mapped[ActorType] = mapped_column(Enum(ActorType))
     state: Mapped[ApprovalState] = mapped_column(Enum(ApprovalState), index=True)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    decided_by: Mapped[str | None] = mapped_column(CHAR(36))
 
 
 class ArtifactRow(Base):
@@ -222,6 +273,42 @@ def _conversation_message_row(message: ConversationMessage) -> ConversationMessa
     )
 
 
+def _conversation_turn_row(turn: ConversationTurn) -> ConversationTurnRow:
+    return ConversationTurnRow(
+        id=str(turn.id),
+        tenant_id=str(turn.tenant_id),
+        conversation_id=str(turn.conversation_id),
+        user_message_id=str(turn.user_message_id),
+        client_request_id=str(turn.client_request_id),
+        state=turn.state,
+        checkpoint=turn.checkpoint,
+        run_lease_id=str(turn.run_lease_id) if turn.run_lease_id else None,
+        run_lease_expires_at=_naive_utc(turn.run_lease_expires_at)
+        if turn.run_lease_expires_at
+        else None,
+        created_at=_naive_utc(turn.created_at),
+        updated_at=_naive_utc(turn.updated_at),
+        completed_at=_naive_utc(turn.completed_at) if turn.completed_at else None,
+    )
+
+
+def _tool_invocation_row(invocation: ToolInvocation) -> ToolInvocationRow:
+    return ToolInvocationRow(
+        id=str(invocation.id),
+        tenant_id=str(invocation.tenant_id),
+        turn_id=str(invocation.turn_id),
+        tool_call_id=invocation.tool_call_id,
+        tool_name=invocation.tool_name,
+        target=invocation.target,
+        state=invocation.state,
+        arguments=invocation.arguments,
+        arguments_sha256=invocation.arguments_sha256,
+        created_at=_naive_utc(invocation.created_at),
+        updated_at=_naive_utc(invocation.updated_at),
+        completed_at=_naive_utc(invocation.completed_at) if invocation.completed_at else None,
+    )
+
+
 def _memory_row(memory: MemoryRecord) -> MemoryRecordRow:
     return MemoryRecordRow(
         id=str(memory.id),
@@ -279,13 +366,18 @@ def _approval_row(approval: Approval) -> ApprovalRow:
     return ApprovalRow(
         id=str(approval.id),
         tenant_id=str(approval.tenant_id),
-        task_id=str(approval.task_id),
+        task_id=str(approval.task_id) if approval.task_id else None,
+        tool_invocation_id=str(approval.tool_invocation_id)
+        if approval.tool_invocation_id
+        else None,
         capability=approval.capability.model_dump(mode="json"),
-        requested_by=str(approval.requested_by),
+        requested_by=str(approval.requested_by) if approval.requested_by else None,
+        requestor_type=approval.requestor_type,
         state=approval.state,
         reason=approval.reason,
         created_at=_naive_utc(approval.created_at),
         decided_at=_naive_utc(approval.decided_at) if approval.decided_at else None,
+        decided_by=str(approval.decided_by) if approval.decided_by else None,
     )
 
 
@@ -343,6 +435,42 @@ def _conversation_message(row: ConversationMessageRow) -> ConversationMessage:
     )
 
 
+def _conversation_turn(row: ConversationTurnRow) -> ConversationTurn:
+    return ConversationTurn(
+        id=UUID(row.id),
+        tenant_id=UUID(row.tenant_id),
+        conversation_id=UUID(row.conversation_id),
+        user_message_id=UUID(row.user_message_id),
+        client_request_id=UUID(row.client_request_id),
+        state=row.state,
+        checkpoint=row.checkpoint,
+        run_lease_id=UUID(row.run_lease_id) if row.run_lease_id else None,
+        run_lease_expires_at=_aware_utc(row.run_lease_expires_at)
+        if row.run_lease_expires_at
+        else None,
+        created_at=_aware_utc(row.created_at),
+        updated_at=_aware_utc(row.updated_at),
+        completed_at=_aware_utc(row.completed_at) if row.completed_at else None,
+    )
+
+
+def _tool_invocation(row: ToolInvocationRow) -> ToolInvocation:
+    return ToolInvocation(
+        id=UUID(row.id),
+        tenant_id=UUID(row.tenant_id),
+        turn_id=UUID(row.turn_id),
+        tool_call_id=row.tool_call_id,
+        tool_name=row.tool_name,
+        target=row.target,
+        state=row.state,
+        arguments=row.arguments,
+        arguments_sha256=row.arguments_sha256,
+        created_at=_aware_utc(row.created_at),
+        updated_at=_aware_utc(row.updated_at),
+        completed_at=_aware_utc(row.completed_at) if row.completed_at else None,
+    )
+
+
 def _memory(row: MemoryRecordRow) -> MemoryRecord:
     return MemoryRecord(
         id=UUID(row.id),
@@ -382,13 +510,16 @@ def _approval(row: ApprovalRow) -> Approval:
     return Approval(
         id=UUID(row.id),
         tenant_id=UUID(row.tenant_id),
-        task_id=UUID(row.task_id),
+        task_id=UUID(row.task_id) if row.task_id else None,
+        tool_invocation_id=UUID(row.tool_invocation_id) if row.tool_invocation_id else None,
         capability=Capability.model_validate(row.capability),
-        requested_by=UUID(row.requested_by),
+        requested_by=UUID(row.requested_by) if row.requested_by else None,
+        requestor_type=row.requestor_type,
         state=row.state,
         reason=row.reason,
         created_at=_aware_utc(row.created_at),
         decided_at=_aware_utc(row.decided_at) if row.decided_at else None,
+        decided_by=UUID(row.decided_by) if row.decided_by else None,
     )
 
 
@@ -662,6 +793,382 @@ class MariaDBRuntimeStore:
             ).all()
         return tuple(_conversation_message(row) for row in reversed(rows))
 
+    async def create_turn(
+        self,
+        user_message: ConversationMessage,
+        turn: ConversationTurn,
+        events: tuple[AuditEvent, ...],
+    ) -> ConversationTurn:
+        async with self._sessions.begin() as session:
+            existing = await session.scalar(
+                select(ConversationTurnRow).where(
+                    ConversationTurnRow.tenant_id == str(turn.tenant_id),
+                    ConversationTurnRow.client_request_id == str(turn.client_request_id),
+                )
+            )
+            if existing is not None:
+                return _conversation_turn(existing)
+            conversation = await session.scalar(
+                select(ConversationRow)
+                .where(
+                    ConversationRow.id == str(turn.conversation_id),
+                    ConversationRow.tenant_id == str(turn.tenant_id),
+                )
+                .with_for_update()
+            )
+            if (
+                conversation is None
+                or user_message.tenant_id != turn.tenant_id
+                or user_message.conversation_id != turn.conversation_id
+                or user_message.id != turn.user_message_id
+                or user_message.role is not MessageRole.USER
+            ):
+                raise LifecycleNotFoundError("conversation not found")
+            candidate = _conversation_turn_row(turn)
+            try:
+                async with session.begin_nested():
+                    session.add_all([_conversation_message_row(user_message), candidate])
+                    await session.flush()
+            except IntegrityError:
+                existing = await session.scalar(
+                    select(ConversationTurnRow).where(
+                        ConversationTurnRow.tenant_id == str(turn.tenant_id),
+                        ConversationTurnRow.client_request_id == str(turn.client_request_id),
+                    )
+                )
+                if existing is None:
+                    raise LifecycleConflictError("turn creation conflict") from None
+                return _conversation_turn(existing)
+            conversation.updated_at = _naive_utc(user_message.created_at)
+            session.add_all(_event_row(event) for event in events)
+            return _conversation_turn(candidate)
+
+    async def get_turn(self, tenant_id: UUID, turn_id: UUID) -> ConversationTurn | None:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(ConversationTurnRow).where(
+                    ConversationTurnRow.id == str(turn_id),
+                    ConversationTurnRow.tenant_id == str(tenant_id),
+                )
+            )
+        return _conversation_turn(row) if row is not None else None
+
+    async def list_conversation_turns(
+        self, tenant_id: UUID, conversation_id: UUID
+    ) -> tuple[ConversationTurn, ...]:
+        async with self._sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(ConversationTurnRow)
+                    .where(
+                        ConversationTurnRow.tenant_id == str(tenant_id),
+                        ConversationTurnRow.conversation_id == str(conversation_id),
+                    )
+                    .order_by(ConversationTurnRow.created_at)
+                )
+            ).all()
+        return tuple(_conversation_turn(row) for row in rows)
+
+    @staticmethod
+    def _validate_run_lease_expiry(expires_at: datetime) -> None:
+        now = datetime.now(UTC)
+        if expires_at <= now or expires_at > now + timedelta(minutes=15):
+            raise LifecycleConflictError("run lease must expire within 15 minutes")
+
+    async def _active_turn(
+        self, session: AsyncSession, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID
+    ) -> ConversationTurnRow:
+        row = await session.scalar(
+            select(ConversationTurnRow)
+            .where(
+                ConversationTurnRow.id == str(turn_id),
+                ConversationTurnRow.tenant_id == str(tenant_id),
+            )
+            .with_for_update()
+        )
+        if row is None:
+            raise LifecycleNotFoundError("turn not found")
+        if (
+            row.state is not ConversationTurnState.RUNNING
+            or row.run_lease_id != str(run_lease_id)
+            or row.run_lease_expires_at is None
+            or row.run_lease_expires_at <= _naive_utc(datetime.now(UTC))
+        ):
+            raise LifecycleConflictError("turn is not actively claimed")
+        return row
+
+    async def claim_pending_turn(
+        self, tenant_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None:
+        self._validate_run_lease_expiry(run_lease_expires_at)
+        async with self._sessions.begin() as session:
+            now = _naive_utc(datetime.now(UTC))
+            row = await session.scalar(
+                select(ConversationTurnRow)
+                .where(
+                    ConversationTurnRow.tenant_id == str(tenant_id),
+                    or_(
+                        ConversationTurnRow.state == ConversationTurnState.PENDING,
+                        (ConversationTurnRow.state == ConversationTurnState.RUNNING)
+                        & (ConversationTurnRow.run_lease_expires_at <= now),
+                    ),
+                )
+                .order_by(ConversationTurnRow.created_at)
+                .with_for_update(skip_locked=True)
+            )
+            if row is None:
+                return None
+            row.state = ConversationTurnState.RUNNING
+            row.run_lease_id = str(run_lease_id)
+            row.run_lease_expires_at = _naive_utc(run_lease_expires_at)
+            row.updated_at = now
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.CONVERSATION_TURN_RUNNING,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": row.id},
+                    )
+                )
+            )
+            return _conversation_turn(row)
+
+    async def checkpoint_turn(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        checkpoint: dict[str, Any],
+    ) -> ConversationTurn:
+        async with self._sessions.begin() as session:
+            row = await self._active_turn(session, tenant_id, turn_id, run_lease_id)
+            row.checkpoint = checkpoint
+            row.updated_at = _naive_utc(datetime.now(UTC))
+            return _conversation_turn(row)
+
+    async def pause_turn(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        checkpoint: dict[str, Any],
+    ) -> ConversationTurn:
+        async with self._sessions.begin() as session:
+            row = await self._active_turn(session, tenant_id, turn_id, run_lease_id)
+            row.state = ConversationTurnState.PAUSED
+            row.checkpoint = checkpoint
+            row.run_lease_id = None
+            row.run_lease_expires_at = None
+            row.updated_at = _naive_utc(datetime.now(UTC))
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.CONVERSATION_TURN_PAUSED,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": row.id},
+                    )
+                )
+            )
+            return _conversation_turn(row)
+
+    async def create_tool_invocation(self, invocation: ToolInvocation) -> ToolInvocation:
+        async with self._sessions.begin() as session:
+            existing = await session.scalar(
+                select(ToolInvocationRow).where(
+                    ToolInvocationRow.turn_id == str(invocation.turn_id),
+                    ToolInvocationRow.tool_call_id == invocation.tool_call_id,
+                )
+            )
+            if existing is not None:
+                return _tool_invocation(existing)
+            turn = await session.scalar(
+                select(ConversationTurnRow)
+                .where(
+                    ConversationTurnRow.id == str(invocation.turn_id),
+                    ConversationTurnRow.tenant_id == str(invocation.tenant_id),
+                )
+                .with_for_update()
+            )
+            if turn is None:
+                raise LifecycleNotFoundError("turn not found")
+            row = _tool_invocation_row(invocation)
+            session.add_all(
+                [
+                    row,
+                    _event_row(
+                        AuditEvent(
+                            tenant_id=invocation.tenant_id,
+                            event_type=EventType.TOOL_INVOCATION_REQUESTED,
+                            actor_type=ActorType.COORDINATOR,
+                            payload={"invocation_id": str(invocation.id)},
+                        )
+                    ),
+                ]
+            )
+            return _tool_invocation(row)
+
+    async def get_tool_invocation(
+        self, tenant_id: UUID, turn_id: UUID, tool_call_id: str
+    ) -> ToolInvocation | None:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(ToolInvocationRow).where(
+                    ToolInvocationRow.tenant_id == str(tenant_id),
+                    ToolInvocationRow.turn_id == str(turn_id),
+                    ToolInvocationRow.tool_call_id == tool_call_id,
+                )
+            )
+        return _tool_invocation(row) if row is not None else None
+
+    async def _finish_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID, state: ToolInvocationState
+    ) -> ToolInvocation:
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(ToolInvocationRow)
+                .where(
+                    ToolInvocationRow.id == str(invocation_id),
+                    ToolInvocationRow.tenant_id == str(tenant_id),
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise LifecycleNotFoundError("tool invocation not found")
+            if row.state in {
+                ToolInvocationState.COMPLETED,
+                ToolInvocationState.FAILED,
+                ToolInvocationState.DENIED,
+            }:
+                if row.state is state:
+                    return _tool_invocation(row)
+                raise LifecycleConflictError("tool invocation is already finished")
+            now = _naive_utc(datetime.now(UTC))
+            row.state = state
+            row.updated_at = now
+            row.completed_at = now
+            event_type = (
+                EventType.TOOL_INVOCATION_COMPLETED
+                if state is ToolInvocationState.COMPLETED
+                else EventType.TOOL_INVOCATION_FAILED
+            )
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=event_type,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"invocation_id": str(invocation_id)},
+                    )
+                )
+            )
+            return _tool_invocation(row)
+
+    async def complete_tool_invocation(
+        self, tenant_id: UUID, invocation_id: UUID
+    ) -> ToolInvocation:
+        return await self._finish_tool_invocation(
+            tenant_id, invocation_id, ToolInvocationState.COMPLETED
+        )
+
+    async def fail_tool_invocation(self, tenant_id: UUID, invocation_id: UUID) -> ToolInvocation:
+        return await self._finish_tool_invocation(
+            tenant_id, invocation_id, ToolInvocationState.FAILED
+        )
+
+    async def create_coordinator_approval(self, approval: Approval) -> Approval:
+        if (
+            approval.requestor_type is not ActorType.COORDINATOR
+            or approval.tool_invocation_id is None
+        ):
+            raise LifecycleConflictError("coordinator approval must reference a tool invocation")
+        async with self._sessions.begin() as session:
+            invocation = await session.scalar(
+                select(ToolInvocationRow)
+                .where(
+                    ToolInvocationRow.id == str(approval.tool_invocation_id),
+                    ToolInvocationRow.tenant_id == str(approval.tenant_id),
+                )
+                .with_for_update()
+            )
+            if invocation is None:
+                raise LifecycleNotFoundError("tool invocation not found")
+            if invocation.state is not ToolInvocationState.PENDING:
+                raise LifecycleConflictError("tool invocation cannot await approval")
+            turn = await session.scalar(
+                select(ConversationTurnRow)
+                .where(ConversationTurnRow.id == invocation.turn_id)
+                .with_for_update()
+            )
+            if turn is None:
+                raise LifecycleNotFoundError("turn not found")
+            now = _naive_utc(datetime.now(UTC))
+            invocation.state = ToolInvocationState.AWAITING_APPROVAL
+            invocation.updated_at = now
+            turn.state = ConversationTurnState.PAUSED
+            turn.run_lease_id = None
+            turn.run_lease_expires_at = None
+            turn.updated_at = now
+            session.add_all(
+                [
+                    _approval_row(approval),
+                    _event_row(
+                        AuditEvent(
+                            tenant_id=approval.tenant_id,
+                            event_type=EventType.APPROVAL_REQUESTED,
+                            actor_type=ActorType.COORDINATOR,
+                            payload={"approval_id": str(approval.id)},
+                        )
+                    ),
+                ]
+            )
+            return approval
+
+    async def complete_turn(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        assistant_message: ConversationMessage,
+    ) -> ConversationTurn:
+        async with self._sessions.begin() as session:
+            row = await self._active_turn(session, tenant_id, turn_id, run_lease_id)
+            if (
+                assistant_message.tenant_id != tenant_id
+                or assistant_message.conversation_id != UUID(row.conversation_id)
+                or assistant_message.role is not MessageRole.ASSISTANT
+            ):
+                raise LifecycleConflictError("assistant message ownership mismatch")
+            conversation = await session.scalar(
+                select(ConversationRow)
+                .where(ConversationRow.id == row.conversation_id)
+                .with_for_update()
+            )
+            if conversation is None:
+                raise LifecycleNotFoundError("conversation not found")
+            now = _naive_utc(datetime.now(UTC))
+            row.state = ConversationTurnState.COMPLETED
+            row.run_lease_id = None
+            row.run_lease_expires_at = None
+            row.updated_at = now
+            row.completed_at = now
+            conversation.updated_at = _naive_utc(assistant_message.created_at)
+            session.add_all(
+                [
+                    _conversation_message_row(assistant_message),
+                    _event_row(
+                        AuditEvent(
+                            tenant_id=tenant_id,
+                            event_type=EventType.CONVERSATION_TURN_COMPLETED,
+                            actor_type=ActorType.COORDINATOR,
+                            payload={"turn_id": str(turn_id)},
+                        )
+                    ),
+                ]
+            )
+            return _conversation_turn(row)
+
     async def register_ara(self, remote_agent: RemoteAgent, event: AuditEvent) -> RemoteAgent:
         async with self._sessions.begin() as session:
             await session.merge(_remote_agent_row(remote_agent))
@@ -884,7 +1391,33 @@ class MariaDBRuntimeStore:
                     raise LifecycleConflictError("artifact ownership mismatch")
             row.state = state
             row.result = detail
-            row.completed_at = _naive_utc(datetime.now(UTC))
+            now = _naive_utc(datetime.now(UTC))
+            row.completed_at = now
+            invocation = await session.scalar(
+                select(ToolInvocationRow)
+                .where(
+                    ToolInvocationRow.task_id == row.id,
+                    ToolInvocationRow.tenant_id == str(tenant_id),
+                )
+                .with_for_update()
+            )
+            if invocation is not None:
+                turn = await session.scalar(
+                    select(ConversationTurnRow)
+                    .where(ConversationTurnRow.id == invocation.turn_id)
+                    .with_for_update()
+                )
+                if turn is None:
+                    raise LifecycleNotFoundError("turn not found")
+                invocation.state = (
+                    ToolInvocationState.COMPLETED
+                    if state is TaskState.COMPLETED
+                    else ToolInvocationState.FAILED
+                )
+                invocation.updated_at = now
+                invocation.completed_at = now
+                turn.state = ConversationTurnState.PENDING
+                turn.updated_at = now
             event_type = {
                 TaskState.COMPLETED: EventType.TASK_COMPLETED,
                 TaskState.FAILED: EventType.TASK_FAILED,
@@ -937,6 +1470,7 @@ class MariaDBRuntimeStore:
                 approval.tenant_id != tenant_id
                 or approval.task_id != task_id
                 or approval.requested_by != ara_id
+                or approval.requestor_type is not ActorType.ARA
             ):
                 raise LifecycleConflictError("approval ownership mismatch")
             required_capabilities = tuple(
@@ -980,10 +1514,50 @@ class MariaDBRuntimeStore:
             )
             if row is None:
                 raise LifecycleNotFoundError("approval not found")
+            if row.state is state:
+                return _approval(row)
             if row.state is not ApprovalState.PENDING:
                 raise LifecycleConflictError("approval is already decided")
             row.state = state
             row.decided_at = _naive_utc(datetime.now(UTC))
+            row.decided_by = str(actor_id)
+            if row.tool_invocation_id is not None:
+                invocation = await session.scalar(
+                    select(ToolInvocationRow)
+                    .where(ToolInvocationRow.id == row.tool_invocation_id)
+                    .with_for_update()
+                )
+                if invocation is None:
+                    raise LifecycleNotFoundError("tool invocation not found")
+                turn = await session.scalar(
+                    select(ConversationTurnRow)
+                    .where(ConversationTurnRow.id == invocation.turn_id)
+                    .with_for_update()
+                )
+                if turn is None:
+                    raise LifecycleNotFoundError("turn not found")
+                now = _naive_utc(datetime.now(UTC))
+                invocation.state = (
+                    ToolInvocationState.PENDING
+                    if state is ApprovalState.GRANTED
+                    else ToolInvocationState.DENIED
+                )
+                invocation.updated_at = now
+                invocation.completed_at = now if state is ApprovalState.DENIED else None
+                turn.state = ConversationTurnState.PENDING
+                turn.updated_at = now
+                if state is ApprovalState.DENIED:
+                    session.add(
+                        _event_row(
+                            AuditEvent(
+                                tenant_id=tenant_id,
+                                event_type=EventType.TOOL_INVOCATION_DENIED,
+                                actor_type=ActorType.USER,
+                                actor_id=actor_id,
+                                payload={"invocation_id": invocation.id},
+                            )
+                        )
+                    )
             session.add(
                 _event_row(
                     AuditEvent(
@@ -995,7 +1569,7 @@ class MariaDBRuntimeStore:
                         ),
                         actor_type=ActorType.USER,
                         actor_id=actor_id,
-                        task_id=UUID(row.task_id),
+                        task_id=UUID(row.task_id) if row.task_id else None,
                         payload={"approval_id": str(approval_id)},
                     )
                 )

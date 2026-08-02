@@ -20,6 +20,8 @@ async def test_tui_mounts_task_and_approval_views(monkeypatch: object) -> None:
         assert app.query_one("#deny", Button).disabled
         assert app.query_one("#promote-memory", Button).disabled
         assert app.query_one("#reject-memory", Button).disabled
+        assert app.query_one("#grant-inline", Button).disabled
+        assert app.query_one("#deny-inline", Button).disabled
         assert app.query_one("#memory-list", Static)
         message_input = app.query_one("#message-input", Input)
         assert message_input.disabled
