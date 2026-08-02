@@ -22,6 +22,7 @@ from astra_memory import BoundedContextCompiler
 from astra_model_providers import (
     ModelCompletion,
     ModelMessage,
+    ModelProviderError,
     PlannerDecision,
     PlannerTask,
     ToolCall,
@@ -34,11 +35,13 @@ class ScriptedProvider:
     def __init__(self, calls: tuple[ModelCompletion, ...]) -> None:
         self._calls = iter(calls)
         self.requests: list[tuple[ModelMessage, ...]] = []
+        self.tools: list[tuple[ToolDefinition, ...]] = []
 
     async def complete(
         self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
     ) -> ModelCompletion:
         self.requests.append(messages)
+        self.tools.append(tools)
         return next(self._calls)
 
     async def close(self) -> None:
@@ -66,6 +69,11 @@ class PlannedProvider(ScriptedProvider):
                 ),
             )
         )
+
+
+class FailingPlannerProvider(ScriptedProvider):
+    async def plan(self, messages: tuple[ModelMessage, ...], max_siblings: int) -> PlannerDecision:
+        raise ModelProviderError("planner failed")
 
 
 class FakeRunner:
@@ -123,7 +131,68 @@ async def test_read_file_tool_result_reaches_final_assistant(tmp_path: Path) -> 
     _, response = await orchestrator.respond(tenant_id, user_id, conversation.id, "Read the notes")
 
     assert response.content == "The launch code is aurora."
+    assert {tool.name for tool in provider.tools[0]} >= {
+        "read_file",
+        "list_directory",
+        "search_files",
+    }
     assert "aurora" in provider.requests[1][-1].content
+
+
+async def test_list_directory_is_bounded_to_workspace(tmp_path: Path) -> None:
+    (tmp_path / "folder").mkdir()
+    (tmp_path / "notes.txt").write_text("notes", encoding="utf-8")
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (tmp_path / "outside-link").symlink_to(outside)
+    tenant_id = uuid4()
+    registry = LocalToolRegistry(
+        Settings(
+            tenant_workspaces={
+                tenant_id: TenantWorkspace(
+                    root=tmp_path,
+                    grants=(Capability(kind=CapabilityKind.FILE_READ, scope="workspace"),),
+                )
+            }
+        )
+    )
+
+    result = await registry.dispatch(tenant_id, "list_directory", {"path": "."})
+    escaped = await registry.dispatch(tenant_id, "list_directory", {"path": "../"})
+
+    assert result.success
+    assert result.content == "folder/\nnotes.txt"
+    assert not result.data["truncated"]
+    assert not escaped.success
+
+
+async def test_planner_failure_falls_back_to_regular_completion() -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    provider = FailingPlannerProvider((ModelCompletion(content="Direct response."),))
+    store = InMemoryRuntimeStore()
+    conversation = await _conversation(store, tenant_id, user_id)
+    orchestrator = ConversationOrchestrator(
+        store,
+        BoundedContextCompiler("safe persona"),
+        provider,
+        12,
+        tool_registry=LocalToolRegistry(Settings(tenant_workspaces={})),
+    )
+
+    _, turn = await orchestrator.start_turn(
+        tenant_id, user_id, conversation.id, uuid4(), "Hello"
+    )
+    completed = await orchestrator.advance_one(tenant_id)
+
+    assert completed is not None and completed.state is ConversationTurnState.COMPLETED
+    events = await store.list_events(tenant_id)
+    assert any(
+        event.event_type.value == "planner.denied"
+        and event.payload["reason"] == "planner provider failed"
+        for event in events
+    )
+    messages = await store.list_messages(tenant_id, conversation.id)
+    assert messages[-1].content == "Direct response."
 
 
 async def test_run_command_pauses_for_approval_then_resumes(tmp_path: Path) -> None:

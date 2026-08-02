@@ -1737,6 +1737,39 @@ class MariaDBRuntimeStore:
             )
             return _conversation_turn(row)
 
+    async def claim_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None:
+        self._validate_run_lease_expiry(run_lease_expires_at)
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(ConversationTurnRow)
+                .where(
+                    ConversationTurnRow.id == str(turn_id),
+                    ConversationTurnRow.tenant_id == str(tenant_id),
+                    ConversationTurnRow.state == ConversationTurnState.PENDING,
+                )
+                .with_for_update(skip_locked=True)
+            )
+            if row is None:
+                return None
+            now = _naive_utc(datetime.now(UTC))
+            row.state = ConversationTurnState.RUNNING
+            row.run_lease_id = str(run_lease_id)
+            row.run_lease_expires_at = _naive_utc(run_lease_expires_at)
+            row.updated_at = now
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.CONVERSATION_TURN_RUNNING,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": row.id},
+                    )
+                )
+            )
+            return _conversation_turn(row)
+
     async def checkpoint_turn(
         self,
         tenant_id: UUID,

@@ -140,6 +140,10 @@ class RuntimeStore(Protocol):
         self, tenant_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
     ) -> ConversationTurn | None: ...
 
+    async def claim_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None: ...
+
     async def checkpoint_turn(
         self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
     ) -> ConversationTurn: ...

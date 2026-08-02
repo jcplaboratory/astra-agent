@@ -1,4 +1,5 @@
-from uuid import uuid4
+import asyncio
+from uuid import UUID, uuid4
 
 import httpx
 from astra_agent import create_app
@@ -80,6 +81,67 @@ def test_conversation_turn_is_durable_and_tenant_scoped() -> None:
             ).status_code
             == 404
         )
+
+
+def test_conversation_message_streams_and_persists_response() -> None:
+    tenant_id = uuid4()
+    headers = _headers(tenant_id)
+    with TestClient(create_app()) as client:
+        created = client.post(
+            "/api/v1/conversations",
+            headers=headers,
+            json={"tenant_id": str(tenant_id), "title": "Stream test"},
+        )
+        conversation_id = created.json()["conversation"]["id"]
+        with client.stream(
+            "POST",
+            f"/api/v1/conversations/{conversation_id}/messages/stream",
+            headers=headers,
+            json={
+                "tenant_id": str(tenant_id),
+                "client_request_id": str(uuid4()),
+                "content": "Stream this",
+            },
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+        assert "event: content" in body
+        assert "Development model received: Stream this" in body
+        assert "event: done" in body
+        loaded = client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
+        assert loaded.json()["messages"][-1]["content"] == "Development model received: Stream this"
+
+
+def test_stream_claims_its_own_turn_when_another_turn_is_pending() -> None:
+    tenant_id = uuid4()
+    headers = _headers(tenant_id)
+    with TestClient(create_app()) as client:
+        created = client.post(
+            "/api/v1/conversations",
+            headers=headers,
+            json={"tenant_id": str(tenant_id)},
+        )
+        conversation_id = created.json()["conversation"]["id"]
+        asyncio.run(
+            client.app.state.orchestrator.start_turn(
+                tenant_id,
+                UUID(headers["X-Astra-User-ID"]),
+                UUID(conversation_id),
+                uuid4(),
+                "Pending turn",
+            )
+        )
+        with client.stream(
+            "POST",
+            f"/api/v1/conversations/{conversation_id}/messages/stream",
+            headers=headers,
+            json={
+                "tenant_id": str(tenant_id),
+                "client_request_id": str(uuid4()),
+                "content": "Current turn",
+            },
+        ) as response:
+            assert response.status_code == 200
 
 
 def test_user_message_survives_model_failure() -> None:

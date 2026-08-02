@@ -1,93 +1,137 @@
+import json
 from uuid import UUID, uuid4
 
 import httpx
 import jwt
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Button, Footer, Header, Input, Label, RichLog, Static
 
 from astra_tui.settings import TUISettings
 
+WELCOME_TAGLINE = "Astra Agent · Distributed Enriched-Persona Agent"
+WELCOME_HINT = "Type a message and press Enter · Ctrl+T shows activity"
+
 
 class AstraAgentApp(App[None]):
     CSS = """
-    Screen { background: #10151c; }
-    #status { height: 3; padding: 1 2; background: #172331; color: #93c5fd; }
-    #workspace { height: 1fr; }
-    #conversation { width: 2fr; border: solid #3b82f6; padding: 1; }
-    #side { width: 1fr; }
-    #tasks, #approvals, #memories, #jobs, #persona, #aras, #artifacts {
-        height: 1fr; border: solid #64748b; padding: 1;
+    Screen { background: #0b0f17; color: #cbd5e1; }
+    Header { background: #0b0f17; color: #64748b; }
+    #status {
+        height: 1; padding: 0 2; background: #0b0f17; color: #475569;
+        border-bottom: solid #11161f;
     }
-    #approvals { border: solid #d97706; }
-    #memories { border: solid #8b5cf6; }
-    Input { dock: bottom; margin: 1 2; }
-    .title { text-style: bold; color: #e2e8f0; }
+    #conversation { height: 1fr; width: 1fr; padding: 0 2; }
+    #conversation-log { height: 1fr; border: none; background: #0b0f17; }
+    #turn-approval {
+        height: auto; padding: 0 2; dock: bottom;
+        color: #f59e0b;
+    }
+    #turn-approval-text { width: 1fr; }
+    #turn-approval.hidden { display: none; }
+    #side {
+        layer: side;
+        position: absolute;
+        offset: 0 0;
+        width: 36; height: 100%;
+        background: #0b0f17;
+        border-left: solid #11161f;
+        padding: 1 1 1 1;
+        overflow: auto;
+        display: block;
+    }
+    #side.hidden { display: none; }
+    .panel { height: auto; padding: 1 0; margin: 0; }
+    .panel .title { color: #475569; text-style: bold; padding: 0; }
+    .panel Static { color: #94a3b8; }
+    #approvals .title { color: #f59e0b; }
+    #memories .title { color: #a78bfa; }
+    #message-input {
+        dock: bottom; margin: 0 2; height: 3;
+        border: none;
+    }
+    #message-input:focus { border: none; }
+    Button { min-width: 6; height: 1; margin: 0 1 0 0; }
+    Footer { background: #0b0f17; color: #475569; }
     """
+
     TITLE = "Astra Agent"
-    SUB_TITLE = "Distributed enriched-persona agent"
+    SUB_TITLE = "D.E.P.A."
+
+    BINDINGS = [
+        ("ctrl+t", "toggle_side", "Activity"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.base_url: str = ""
+        self.tenant_id: str | None = None
+        self.user_id: str | None = None
+        self.access_token: str | None = None
+        self.pending_approval_id: str | None = None
+        self.conversation_id: str | None = None
+        self.candidate_memory_id: str | None = None
+        self.active_turn_id: str | None = None
+        self.active_turn_paused = False
+        self.latest_artifact_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Astra Agent: checking...", id="status")
-        with Horizontal(id="workspace"):
-            with Vertical(id="conversation"):
-                yield Label("Conversation", classes="title")
-                yield RichLog(id="conversation-log", wrap=True)
-                with Horizontal(id="turn-approval"):
-                    yield Static("", id="turn-approval-text")
-                    yield Button("Grant", id="grant-inline", variant="success", disabled=True)
-                    yield Button("Deny", id="deny-inline", variant="error", disabled=True)
-            with Vertical(id="side"):
-                with Vertical(id="tasks"):
-                    yield Label("Tasks", classes="title")
-                    yield Static("No active delegations", id="task-list")
-                with Vertical(id="approvals"):
-                    yield Label("Approvals", classes="title")
-                    yield Static("No pending approvals", id="approval-list")
-                    with Horizontal():
-                        yield Button("Grant", id="grant", variant="success", disabled=True)
-                        yield Button("Deny", id="deny", variant="error", disabled=True)
-                with Vertical(id="memories"):
-                    yield Label("Memory", classes="title")
-                    yield Static("No approved memory", id="memory-list")
-                    with Horizontal():
-                        yield Button("Promote", id="promote-memory", disabled=True)
-                        yield Button("Reject", id="reject-memory", disabled=True)
-                with Vertical(id="jobs"):
-                    yield Label("Background Jobs", classes="title")
-                    yield Static("No failed jobs", id="job-list")
-                with Vertical(id="persona"):
-                    yield Label("Active Persona", classes="title")
-                    yield Static("Loading...", id="persona-list")
-                with Vertical(id="aras"):
-                    yield Label("ARA Health", classes="title")
-                    yield Static("Loading...", id="ara-list")
-                with Vertical(id="artifacts"):
-                    yield Label("Artifacts", classes="title")
-                    yield Static("No artifacts", id="artifact-list")
-                    yield Button("Download latest", id="download-artifact", disabled=True)
-        yield Input(placeholder="Message Astra", id="message-input", disabled=True)
+        yield Static("Astra Agent · starting…", id="status")
+        with Vertical(id="conversation"):
+            yield RichLog(id="conversation-log", wrap=True, markup=True)
+            yield Static("", id="live-response")
+            with Horizontal(id="turn-approval", classes="hidden"):
+                yield Static("", id="turn-approval-text")
+                yield Button("Grant", id="grant-inline", variant="success", disabled=True)
+                yield Button("Deny", id="deny-inline", variant="error", disabled=True)
+        with Vertical(id="side", classes="hidden"):
+            with Vertical(id="tasks", classes="panel"):
+                yield Label("Tasks", classes="title")
+                yield Static("No active delegations", id="task-list")
+            with Vertical(id="approvals", classes="panel"):
+                yield Label("Approvals", classes="title")
+                yield Static("No pending approvals", id="approval-list")
+                with Horizontal():
+                    yield Button("Grant", id="grant", variant="success", disabled=True)
+                    yield Button("Deny", id="deny", variant="error", disabled=True)
+            with Vertical(id="memories", classes="panel"):
+                yield Label("Memory", classes="title")
+                yield Static("No approved memory", id="memory-list")
+                with Horizontal():
+                    yield Button("Promote", id="promote-memory", disabled=True)
+                    yield Button("Reject", id="reject-memory", disabled=True)
+            with Vertical(id="jobs", classes="panel"):
+                yield Label("Failed jobs", classes="title")
+                yield Static("No failed jobs", id="job-list")
+            with Vertical(id="persona", classes="panel"):
+                yield Label("Active persona", classes="title")
+                yield Static("Loading…", id="persona-list")
+            with Vertical(id="aras", classes="panel"):
+                yield Label("ARA health", classes="title")
+                yield Static("Loading…", id="ara-list")
+            with Vertical(id="artifacts", classes="panel"):
+                yield Label("Artifacts", classes="title")
+                yield Static("No artifacts", id="artifact-list")
+                yield Button("Download latest", id="download-artifact", disabled=True)
+        yield Input(placeholder="Message Astra…", id="message-input", disabled=True)
         yield Footer()
 
     async def on_mount(self) -> None:
+        self._render_welcome()
         settings = TUISettings()
         self.base_url = settings.agent_url
         self.tenant_id = str(settings.tenant_id) if settings.tenant_id else None
         self.user_id = str(settings.user_id) if settings.user_id else None
         self.access_token = settings.access_token
-        self.pending_approval_id: str | None = None
         self.conversation_id = str(settings.conversation_id) if settings.conversation_id else None
-        self.candidate_memory_id: str | None = None
-        self.active_turn_id: str | None = None
-        self.active_turn_paused = False
-        self.latest_artifact_id: str | None = None
         status = self.query_one("#status", Static)
         if not self.access_token and settings.tui_dev_login:
             try:
                 self.access_token = await self._development_login(settings)
             except (httpx.HTTPError, KeyError, ValueError) as error:
-                status.update(f"Astra Agent: local login failed | {error}")
+                status.update(f"Astra Agent · local login failed · {error}")
         if self.access_token and not self.tenant_id:
             self.tenant_id = self._tenant_from_token(self.access_token)
         try:
@@ -98,10 +142,11 @@ class AstraAgentApp(App[None]):
                 response = await client.get("/health")
                 response.raise_for_status()
             health = response.json()
-            summary = f"API {health['version']} | {health['persistence']} persistence"
-            status.update(f"Astra Agent: online | {summary}")
+            status.update(
+                f"Astra Agent · online · API {health['version']} · {health['persistence']}"
+            )
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
-            status.update(f"Astra Agent: unavailable | {error}")
+            status.update(f"Astra Agent · unavailable · {error}")
         await self.refresh_activity()
         message_input = self.query_one("#message-input", Input)
         message_input.disabled = not self._is_authenticated()
@@ -109,11 +154,19 @@ class AstraAgentApp(App[None]):
             message_input.placeholder = (
                 "Authentication required: configure ASTRA_ACCESS_TOKEN or ASTRA_TUI_DEV_LOGIN"
             )
-            if "unavailable" not in str(status.render()) and "failed" not in str(status.render()):
-                status.update("Astra Agent: online | authentication required")
         else:
             message_input.focus()
         self.set_interval(2, self.refresh_activity)
+
+    def _render_welcome(self) -> None:
+        log = self.query_one("#conversation-log", RichLog)
+        log.write(f"[bold #93c5fd]{WELCOME_TAGLINE}[/]")
+        log.write(f"[#64748b]{WELCOME_HINT}[/]")
+        log.write("")
+
+    def action_toggle_side(self) -> None:
+        side = self.query_one("#side", Vertical)
+        side.set_class(not side.has_class("hidden"), "hidden")
 
     async def _development_login(self, settings: TUISettings) -> str:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -217,6 +270,8 @@ class AstraAgentApp(App[None]):
         inline_enabled = bool(enabled and self.active_turn_paused)
         self.query_one("#grant-inline", Button).disabled = not inline_enabled
         self.query_one("#deny-inline", Button).disabled = not inline_enabled
+        approval_row = self.query_one("#turn-approval", Horizontal)
+        approval_row.set_class(not inline_enabled, "hidden")
         self.query_one("#turn-approval-text", Static).update(
             "Approval required for this turn" if inline_enabled else ""
         )
@@ -318,6 +373,7 @@ class AstraAgentApp(App[None]):
 
     async def _submit_message(self, content: str) -> None:
         log = self.query_one("#conversation-log", RichLog)
+        live = self.query_one("#live-response", Static)
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url, timeout=65, headers=self._user_headers()
@@ -329,23 +385,39 @@ class AstraAgentApp(App[None]):
                     )
                     response.raise_for_status()
                     self.conversation_id = response.json()["conversation"]["id"]
-                response = await client.post(
-                    f"/api/v1/conversations/{self.conversation_id}/messages",
+                reasoning, answer = "", ""
+                async with client.stream(
+                    "POST",
+                    f"/api/v1/conversations/{self.conversation_id}/messages/stream",
                     json={
                         "tenant_id": self.tenant_id,
                         "client_request_id": str(uuid4()),
                         "content": content,
                     },
-                )
-                response.raise_for_status()
-            payload = response.json()
-            if response.status_code == httpx.codes.ACCEPTED:
-                self.active_turn_id = payload["turn"]["id"]
-                self.active_turn_paused = payload["turn"]["state"] == "paused"
-                log.write("[bold #fcd34d]Astra[/]: Working on your request...")
-                return
-            assistant = payload["assistant_message"]["content"]
-            log.write(f"[bold #86efac]Astra[/]: {assistant}")
+                ) as response:
+                    response.raise_for_status()
+                    event = ""
+                    async for line in response.aiter_lines():
+                        if line.startswith("event: "):
+                            event = line[7:]
+                        elif line.startswith("data: ") and event in {"reasoning", "content"}:
+                            payload = json.loads(line[6:])
+                            chunk = payload["content"]
+                            if event == "reasoning":
+                                reasoning += chunk
+                            else:
+                                answer += chunk
+                            display = ""
+                            if reasoning:
+                                display += f"Thinking\n{reasoning}\n\n"
+                            display += f"Astra\n{answer}"
+                            live.update(Text(display))
+                        elif line.startswith("data: ") and event == "tool_call":
+                            tool = json.loads(line[6:]).get("tool", "tool")
+                            live.update(Text(f"Astra\nUsing {tool}..."))
+            if answer:
+                log.write(f"[bold #86efac]Astra[/]: {answer}")
+            live.update("")
         except (httpx.HTTPError, KeyError, ValueError) as error:
             log.write(f"[bold #fca5a5]Error[/]: {error}")
 

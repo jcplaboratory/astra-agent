@@ -26,9 +26,13 @@ services:
       ASTRA_ARTIFACT_ENDPOINT_URL: http://minio:9000
       ASTRA_ARTIFACT_ACCESS_KEY: ${MINIO_ROOT_USER:-astra-development}
       ASTRA_ARTIFACT_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-development-only-change-me}
+      ASTRA_TENANT_WORKSPACES: >-
+        {"00000000-0000-0000-0000-000000000001":{"root":"/workspace","grants":[{"kind":"file.read","scope":"workspace"}]}}
     depends_on:
       mariadb:
         condition: service_healthy
+    volumes:
+      - /Users/cedric/Downloads:/workspace/downloads:ro
   ara-ingress:
     image: nginx:1.27-alpine
     ports:

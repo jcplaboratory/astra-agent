@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -88,6 +89,7 @@ from astra_runtime import (
     create_schema,
 )
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -704,6 +706,51 @@ def create_app(
         return ConversationTurnResponse(
             turn=refreshed, user_message=user_message, assistant_message=assistant_message
         )
+
+    @api.post(
+        "/conversations/{conversation_id}/messages/stream",
+        tags=["conversations"],
+    )
+    async def stream_message(
+        conversation_id: UUID,
+        body: SendMessageRequest,
+        request: Request,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> StreamingResponse:
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        if await runtime_store.get_conversation(body.tenant_id, conversation_id) is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
+        user_message, turn = await request.app.state.orchestrator.start_turn(
+            body.tenant_id,
+            principal.user_id,
+            conversation_id,
+            body.client_request_id,
+            body.content,
+        )
+        run_lease_id = uuid4()
+        claimed = await runtime_store.claim_turn(
+            body.tenant_id, turn.id, run_lease_id, datetime.now(UTC) + timedelta(minutes=5)
+        )
+        if claimed is None or claimed.id != turn.id:
+            raise HTTPException(status.HTTP_409_CONFLICT, "conversation turn is already running")
+
+        async def events() -> AsyncIterator[str]:
+            yield f"event: turn\ndata: {json.dumps({'turn_id': str(turn.id)})}\n\n"
+            try:
+                async for event in request.app.state.orchestrator.stream_turn(
+                    claimed, run_lease_id
+                ):
+                    payload = {"content": event.content}
+                    if event.tool_call is not None:
+                        payload["tool"] = event.tool_call.name
+                    yield f"event: {event.kind}\ndata: {json.dumps(payload)}\n\n"
+                yield "event: done\ndata: {}\n\n"
+            except ModelProviderError:
+                yield "event: error\ndata: {\"message\": \"model provider failed\"}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
 
     @api.get(
         "/conversations/{conversation_id}/turns",

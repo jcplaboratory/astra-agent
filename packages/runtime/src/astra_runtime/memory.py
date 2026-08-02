@@ -767,6 +767,37 @@ class InMemoryRuntimeStore:
             )
             return claimed
 
+    async def claim_turn(
+        self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, run_lease_expires_at: datetime
+    ) -> ConversationTurn | None:
+        self._validate_run_lease_expiry(run_lease_expires_at)
+        async with self._lock:
+            turn = self._turns.get(turn_id)
+            if (
+                turn is None
+                or turn.tenant_id != tenant_id
+                or turn.state is not ConversationTurnState.PENDING
+            ):
+                return None
+            claimed = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.RUNNING,
+                    "run_lease_id": run_lease_id,
+                    "run_lease_expires_at": run_lease_expires_at,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._turns[turn.id] = claimed
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_RUNNING,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn.id)},
+                )
+            )
+            return claimed
+
     async def checkpoint_turn(
         self, tenant_id: UUID, turn_id: UUID, run_lease_id: UUID, checkpoint: dict[str, Any]
     ) -> ConversationTurn:

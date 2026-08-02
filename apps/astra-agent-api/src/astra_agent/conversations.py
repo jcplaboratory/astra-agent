@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -30,6 +31,7 @@ from astra_model_providers import (
     ModelCompletion,
     ModelMessage,
     ModelProviderError,
+    ModelStreamEvent,
     PlannerDecision,
     ToolCall,
     ToolDefinition,
@@ -156,11 +158,22 @@ class ConversationOrchestrator:
             messages.append(await self._sibling_provenance(turn))
         elif self._delegation_enabled:
             planner = getattr(self._model_provider, "plan", None)
-            decision = (
-                await planner(tuple(messages), self._max_delegation_siblings)
-                if callable(planner)
-                else PlannerDecision()
-            )
+            try:
+                decision = (
+                    await planner(tuple(messages), self._max_delegation_siblings)
+                    if callable(planner)
+                    else PlannerDecision()
+                )
+            except ModelProviderError:
+                await self._store.append_event(
+                    AuditEvent(
+                        tenant_id=turn.tenant_id,
+                        event_type=EventType.PLANNER_DENIED,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": str(turn.id), "reason": "planner provider failed"},
+                    )
+                )
+                decision = PlannerDecision()
             policy = validate_planner_decision(decision, self._max_delegation_siblings)
             if not policy.allowed:
                 await self._store.append_event(
@@ -304,6 +317,75 @@ class ConversationOrchestrator:
                 content="I stopped after reaching the tool-call limit.",
             ),
         )
+
+    async def stream_turn(
+        self, turn: ConversationTurn, run_lease_id: UUID
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages, iterations, _ = await self._messages_for_turn(turn)
+        definitions = self._tool_registry.definitions(turn.tenant_id)
+        if self._delegation_enabled:
+            definitions = (*definitions, _ARA_DELEGATE_TOOL)
+        streamer = getattr(self._model_provider, "stream", None)
+        if not callable(streamer):
+            raise ModelProviderError("model provider does not support streaming")
+        try:
+            while iterations < self._max_tool_iterations:
+                content: list[str] = []
+                calls: list[ToolCall] = []
+                async for event in streamer(tuple(messages), definitions):
+                    if event.kind == "content":
+                        content.append(event.content)
+                    elif event.kind == "tool_call" and event.tool_call is not None:
+                        calls.append(event.tool_call)
+                    yield event
+                if not calls:
+                    await self._store.complete_turn(
+                        turn.tenant_id,
+                        turn.id,
+                        run_lease_id,
+                        ConversationMessage(
+                            tenant_id=turn.tenant_id,
+                            conversation_id=turn.conversation_id,
+                            role=MessageRole.ASSISTANT,
+                            content="".join(content) or "I could not produce a response.",
+                        ),
+                    )
+                    return
+                messages.append(
+                    ModelMessage(
+                        role="system",
+                        content=self._tool_call_summary(tuple(calls), "".join(content) or None),
+                    )
+                )
+                known_tools = {definition.name for definition in definitions}
+                for call in calls:
+                    paused = await self._execute_call(
+                        turn, run_lease_id, call, known_tools, messages
+                    )
+                    if paused is not None:
+                        return
+                iterations += 1
+            await self._store.complete_turn(
+                turn.tenant_id,
+                turn.id,
+                run_lease_id,
+                ConversationMessage(
+                    tenant_id=turn.tenant_id,
+                    conversation_id=turn.conversation_id,
+                    role=MessageRole.ASSISTANT,
+                    content="I stopped after reaching the tool-call limit.",
+                ),
+            )
+        except ModelProviderError:
+            await self._store.append_event(
+                AuditEvent(
+                    tenant_id=turn.tenant_id,
+                    event_type=EventType.MODEL_FAILED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn.id)},
+                )
+            )
+            raise
 
     async def _messages_for_turn(
         self, turn: ConversationTurn

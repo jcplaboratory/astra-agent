@@ -62,7 +62,10 @@ class ReadFileTool:
     capability = FILE_READ_CAPABILITY
     definition = ToolDefinition(
         name="read_file",
-        description="Read a workspace-relative text file, with a configured size limit.",
+        description=(
+            "Read a text file under /workspace, with a configured size limit. "
+            "Use paths relative to /workspace, for example downloads/notes.txt."
+        ),
         parameters={
             "type": "object",
             "properties": {"path": {"type": "string"}},
@@ -91,12 +94,57 @@ class ReadFileTool:
         )
 
 
+class ListDirectoryTool:
+    capability = FILE_READ_CAPABILITY
+    definition = ToolDefinition(
+        name="list_directory",
+        description=(
+            "List immediate non-symlink entries under /workspace. Use paths relative to "
+            "/workspace, for example downloads/."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {"path": {"type": "string", "default": "."}},
+            "additionalProperties": False,
+        },
+    )
+
+    def __init__(self, max_entries: int) -> None:
+        self._max_entries = max_entries
+
+    async def execute(self, params: Mapping[str, Any], workspace: TenantWorkspace) -> ToolResult:
+        try:
+            path = _relative_workspace_path(workspace.root, params.get("path", "."))
+            if not path.is_dir():
+                return ToolResult(success=False, error="path is not a directory")
+            entries = sorted(
+                (
+                    entry.name + ("/" if entry.is_dir() else "")
+                    for entry in path.iterdir()
+                    if not entry.is_symlink()
+                ),
+                key=str.casefold,
+            )
+        except (OSError, ValueError) as error:
+            return ToolResult(success=False, error=str(error))
+        truncated = len(entries) > self._max_entries
+        return ToolResult(
+            success=True,
+            content="\n".join(entries[: self._max_entries]),
+            data={
+                "path": str(path.relative_to(workspace.root)),
+                "truncated": truncated,
+            },
+        )
+
+
 class SearchFilesTool:
     capability = FILE_READ_CAPABILITY
     definition = ToolDefinition(
         name="search_files",
         description=(
-            "Literal, case-insensitive search of text files under a workspace-relative path."
+            "Literal, case-insensitive search of text files under /workspace. Use paths "
+            "relative to /workspace, for example downloads/."
         ),
         parameters={
             "type": "object",
@@ -317,6 +365,7 @@ class LocalToolRegistry:
         self._workspaces = settings.tenant_workspaces
         tools: dict[str, LocalTool] = {
             "read_file": ReadFileTool(settings.tool_read_max_bytes),
+            "list_directory": ListDirectoryTool(settings.tool_search_max_files),
             "search_files": SearchFilesTool(
                 settings.tool_search_max_file_bytes,
                 settings.tool_search_max_files,

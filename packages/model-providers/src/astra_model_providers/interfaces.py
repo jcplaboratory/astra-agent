@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from typing import Any, Protocol, overload
 
 from pydantic import BaseModel, ConfigDict
@@ -29,6 +30,13 @@ class ModelCompletion(BaseModel):
     tool_calls: tuple[ToolCall, ...] = ()
 
 
+class ModelStreamEvent(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    kind: str
+    content: str = ""
+    tool_call: ToolCall | None = None
+
+
 class PlannerTask(BaseModel):
     """One bounded, read-only ARA operation proposed by the main model."""
 
@@ -55,6 +63,10 @@ class MainModelProvider(Protocol):
     async def complete(
         self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...]
     ) -> ModelCompletion: ...
+
+    def stream(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...] = ()
+    ) -> AsyncIterator[ModelStreamEvent]: ...
 
     async def close(self) -> None: ...
 

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from astra_domain import ApprovalState, Capability, CapabilityKind
 from astra_model_providers import PlannerDecision
+from pydantic import ValidationError
 
 
 @dataclass(frozen=True)
@@ -41,7 +42,12 @@ def validate_planner_decision(decision: PlannerDecision, max_siblings: int) -> P
         if task.objective.strip() in objectives:
             return PolicyDecision(False, False, "planner contains duplicate sibling objectives")
         objectives.add(task.objective.strip())
-        capabilities = tuple(Capability.model_validate(item) for item in task.required_capabilities)
+        try:
+            capabilities = tuple(
+                Capability.model_validate(item) for item in task.required_capabilities
+            )
+        except ValidationError:
+            return PolicyDecision(False, False, "planner requested an invalid capability")
         if capabilities != expected:
             return PolicyDecision(False, False, "planner requested a non-read-only capability")
         if (

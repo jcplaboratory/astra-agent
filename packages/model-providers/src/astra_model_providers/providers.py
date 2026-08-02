@@ -1,4 +1,5 @@
 import json
+from collections.abc import AsyncIterator
 from typing import Any, overload
 
 import httpx
@@ -6,6 +7,7 @@ import httpx
 from astra_model_providers.interfaces import (
     ModelCompletion,
     ModelMessage,
+    ModelStreamEvent,
     PlannerDecision,
     PlannerTask,
     ToolCall,
@@ -76,6 +78,13 @@ class DevelopmentModelProvider:
         )
         content = f"Development model received: {user_message}"
         return ModelCompletion(content=content) if tools is not None else content
+
+    async def stream(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...] = ()
+    ) -> AsyncIterator[ModelStreamEvent]:
+        content = await self.complete(messages)
+        assert isinstance(content, str)
+        yield ModelStreamEvent(kind="content", content=content)
 
     async def close(self) -> None:
         return None
@@ -156,6 +165,72 @@ class OpenRouterModelProvider:
             json.JSONDecodeError,
         ) as error:
             raise ModelProviderError("OpenRouter request failed") from error
+
+    async def stream(
+        self, messages: tuple[ModelMessage, ...], tools: tuple[ToolDefinition, ...] = ()
+    ) -> AsyncIterator[ModelStreamEvent]:
+        request = {
+            "model": self.model,
+            "messages": [message.model_dump() for message in messages],
+            "stream": True,
+        }
+        if tools:
+            request["tools"] = [
+                {"type": "function", "function": tool.model_dump()} for tool in tools
+            ]
+        tool_calls: dict[int, dict[str, Any]] = {}
+        try:
+            async with self._client.stream("POST", "/chat/completions", json=request) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    payload: dict[str, Any] = json.loads(data)
+                    delta = payload["choices"][0].get("delta", {})
+                    reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        yield ModelStreamEvent(kind="reasoning", content=reasoning)
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        yield ModelStreamEvent(kind="content", content=content)
+                    for call in delta.get("tool_calls", []):
+                        index = call.get("index")
+                        if not isinstance(index, int):
+                            continue
+                        buffered = tool_calls.setdefault(index, {"function": {}})
+                        if isinstance(call.get("id"), str):
+                            buffered["id"] = call["id"]
+                        function = call.get("function")
+                        if isinstance(function, dict):
+                            if isinstance(function.get("name"), str):
+                                buffered["function"]["name"] = function["name"]
+                            if isinstance(function.get("arguments"), str):
+                                buffered["function"]["arguments"] = (
+                                    buffered["function"].get("arguments", "")
+                                    + function["arguments"]
+                                )
+                for call in tool_calls.values():
+                    function = call["function"]
+                    yield ModelStreamEvent(
+                        kind="tool_call",
+                        tool_call=ToolCall(
+                            id=call["id"],
+                            name=function["name"],
+                            arguments=json.loads(function.get("arguments", "{}")),
+                        ),
+                    )
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise ModelProviderError("OpenRouter streaming request failed") from error
 
     async def plan(self, messages: tuple[ModelMessage, ...], max_siblings: int) -> PlannerDecision:
         schema = PlannerDecision.model_json_schema()
