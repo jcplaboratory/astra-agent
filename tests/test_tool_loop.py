@@ -19,7 +19,14 @@ from astra_domain import (
     ToolInvocationTarget,
 )
 from astra_memory import BoundedContextCompiler
-from astra_model_providers import ModelCompletion, ModelMessage, ToolCall, ToolDefinition
+from astra_model_providers import (
+    ModelCompletion,
+    ModelMessage,
+    PlannerDecision,
+    PlannerTask,
+    ToolCall,
+    ToolDefinition,
+)
 from astra_runtime import InMemoryRuntimeStore
 
 
@@ -36,6 +43,29 @@ class ScriptedProvider:
 
     async def close(self) -> None:
         return None
+
+
+class PlannedProvider(ScriptedProvider):
+    async def plan(self, messages: tuple[ModelMessage, ...], max_siblings: int) -> PlannerDecision:
+        assert max_siblings == 2
+        return PlannerDecision(
+            tasks=(
+                PlannerTask(
+                    objective="Inspect authentication",
+                    required_capabilities=({"kind": "file.read", "scope": "repository"},),
+                    deliverable_contract=(
+                        "Return bounded repository findings with file and line evidence."
+                    ),
+                ),
+                PlannerTask(
+                    objective="Inspect configuration",
+                    required_capabilities=({"kind": "file.read", "scope": "repository"},),
+                    deliverable_contract=(
+                        "Return bounded repository findings with file and line evidence."
+                    ),
+                ),
+            )
+        )
 
 
 class FakeRunner:
@@ -204,3 +234,61 @@ async def test_delegate_ara_pauses_then_resumes_with_task_result(tmp_path: Path)
 
     assert completed is not None and completed.state is ConversationTurnState.COMPLETED
     assert "auth is sound" in provider.requests[1][-1].content
+
+
+async def test_planned_siblings_are_distinct_targeted_and_report_partial_failure() -> None:
+    tenant_id, user_id = uuid4(), uuid4()
+    capability = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
+    provider = PlannedProvider((ModelCompletion(content="Partial repository findings."),))
+    store = InMemoryRuntimeStore()
+    conversation = await _conversation(store, tenant_id, user_id)
+    aras = tuple(uuid4() for _ in range(2))
+    for ara_id in aras:
+        await store.register_ara(
+            RemoteAgent(
+                id=ara_id,
+                tenant_id=tenant_id,
+                name=str(ara_id),
+                capabilities=(capability,),
+                runtime_version="test",
+            ),
+            AuditEvent(
+                tenant_id=tenant_id,
+                event_type=EventType.ARA_REGISTERED,
+                actor_type=ActorType.ARA,
+                actor_id=ara_id,
+            ),
+        )
+    orchestrator = ConversationOrchestrator(
+        store,
+        BoundedContextCompiler("safe persona"),
+        provider,
+        12,
+        tool_registry=LocalToolRegistry(Settings(tenant_workspaces={})),
+    )
+    _, turn = await orchestrator.start_turn(tenant_id, user_id, conversation.id, uuid4(), "Inspect")
+
+    paused = await orchestrator.advance_one(tenant_id)
+    tasks = await store.list_tasks(tenant_id)
+    assert paused is not None and paused.state is ConversationTurnState.PAUSED
+    assert {task.target_ara_id for task in tasks} == set(aras)
+    assert (
+        await store.lease_task(tenant_id, uuid4(), datetime.now(UTC) + timedelta(minutes=1)) is None
+    )
+    for index, task in enumerate(tasks):
+        ara_id = task.target_ara_id
+        assert ara_id is not None
+        leased = await store.lease_task(tenant_id, ara_id, datetime.now(UTC) + timedelta(minutes=1))
+        assert leased is not None
+        await store.finish_task(
+            tenant_id,
+            ara_id,
+            task.id,
+            leased[1].id,
+            TaskState.COMPLETED if index == 0 else TaskState.FAILED,
+            "finding" if index == 0 else "inspection failed",
+        )
+
+    completed = await orchestrator.advance_one(tenant_id)
+    assert completed is not None and completed.state is ConversationTurnState.COMPLETED
+    assert '"partial_failure": true' in provider.requests[-1][-1].content

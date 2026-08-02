@@ -3,7 +3,14 @@ from typing import Any, overload
 
 import httpx
 
-from astra_model_providers.interfaces import ModelCompletion, ModelMessage, ToolCall, ToolDefinition
+from astra_model_providers.interfaces import (
+    ModelCompletion,
+    ModelMessage,
+    PlannerDecision,
+    PlannerTask,
+    ToolCall,
+    ToolDefinition,
+)
 
 
 class ModelProviderError(Exception):
@@ -11,6 +18,27 @@ class ModelProviderError(Exception):
 
 
 class DevelopmentModelProvider:
+    def __init__(self, planner_decision: PlannerDecision | None = None) -> None:
+        self._planner_decision = planner_decision
+
+    async def plan(self, messages: tuple[ModelMessage, ...], max_siblings: int) -> PlannerDecision:
+        if self._planner_decision is not None:
+            return self._planner_decision
+        request = next((item.content for item in reversed(messages) if item.role == "user"), "")
+        if "inspect" not in request.lower() and "repository" not in request.lower():
+            return PlannerDecision()
+        return PlannerDecision(
+            tasks=(
+                PlannerTask(
+                    objective=request,
+                    required_capabilities=({"kind": "file.read", "scope": "repository"},),
+                    deliverable_contract=(
+                        "Return bounded repository findings with file and line evidence."
+                    ),
+                ),
+            )
+        )
+
     @overload
     async def complete(self, messages: tuple[ModelMessage, ...]) -> str: ...
 
@@ -128,6 +156,54 @@ class OpenRouterModelProvider:
             json.JSONDecodeError,
         ) as error:
             raise ModelProviderError("OpenRouter request failed") from error
+
+    async def plan(self, messages: tuple[ModelMessage, ...], max_siblings: int) -> PlannerDecision:
+        schema = PlannerDecision.model_json_schema()
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Return only the planner_decision function call. Propose at most "
+                        f"{max_siblings} independent read-only repository inspections."
+                    ),
+                },
+                *(message.model_dump() for message in messages),
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "planner_decision",
+                        "description": "Return a bounded ARA delegation plan.",
+                        "parameters": schema,
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "planner_decision"}},
+        }
+        try:
+            response = await self._client.post("/chat/completions", json=request)
+            response.raise_for_status()
+            payload: dict[str, Any] = response.json()
+            calls = payload["choices"][0]["message"]["tool_calls"]
+            if not isinstance(calls, list) or len(calls) != 1:
+                raise ValueError("planner returned an invalid function call count")
+            call = calls[0]
+            if call["function"]["name"] != "planner_decision":
+                raise ValueError("planner returned an unexpected function")
+            arguments = json.loads(call["function"]["arguments"])
+            return PlannerDecision.model_validate(arguments)
+        except (
+            httpx.HTTPError,
+            KeyError,
+            IndexError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as error:
+            raise ModelProviderError("OpenRouter planner request failed") from error
 
     async def close(self) -> None:
         if self._owns_client:

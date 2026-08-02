@@ -60,10 +60,12 @@ class Settings(BaseSettings):
     qdrant_api_key: str | None = None
     qdrant_collection: str = "astra_memories"
     memory_extractor_backend: Literal["deterministic", "local_model"] = "deterministic"
+    context_compressor_backend: Literal["deterministic", "local_model"] = "deterministic"
     local_model_url: str = "http://127.0.0.1:11434/v1"
     local_model_name: str = "qwen2.5:3b"
     local_model_api_key: str | None = None
     delegation_enabled: bool = True
+    delegation_max_siblings: int = Field(default=2, ge=1, le=8)
     delegation_wait_seconds: float = Field(default=30, ge=1, le=300)
     delegation_poll_seconds: float = Field(default=0.25, ge=0.05, le=5)
     tenant_workspaces: dict[UUID, TenantWorkspace] = Field(default_factory=dict)

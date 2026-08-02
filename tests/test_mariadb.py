@@ -17,6 +17,8 @@ from astra_domain import (
     MemoryRecord,
     MemoryState,
     MessageRole,
+    MigrationBatch,
+    PersonaCore,
     RemoteAgent,
     Task,
     TaskState,
@@ -254,5 +256,73 @@ async def test_mariadb_memory_lifecycle() -> None:
         assert deleted.state is MemoryState.DELETED
         assert await store.list_memories(tenant_id) == ()
         assert await store.get_memory(uuid4(), stored.id) is None
+    finally:
+        await store.close()
+
+
+@pytest.mark.skipif(
+    not os.getenv("ASTRA_TEST_DATABASE_URL"), reason="MariaDB test URL not configured"
+)
+async def test_mariadb_activation_promotes_only_batch_candidates() -> None:
+    engine = create_async_engine(os.environ["ASTRA_TEST_DATABASE_URL"], pool_pre_ping=True)
+    store = MariaDBRuntimeStore(engine)
+    try:
+        tenant_id, actor_id = uuid4(), uuid4()
+        batch = MigrationBatch(
+            tenant_id=tenant_id,
+            source_system="hermes_holographic",
+            source_database_fingerprint="a" * 64,
+        )
+        candidate = MemoryRecord(
+            tenant_id=tenant_id,
+            kind=MemoryKind.FACT,
+            content="Batch candidate",
+            normalized_content="batch candidate",
+            source_event_id=uuid4(),
+            source_message_id=uuid4(),
+            confidence=0.7,
+            import_batch_id=batch.id,
+            source_system=batch.source_system,
+            source_database_fingerprint=batch.source_database_fingerprint,
+            source_external_id="candidate",
+        )
+        await store.stage_migration_batch(batch, (candidate,), actor_id)
+        other = candidate.model_copy(
+            update={
+                "id": uuid4(),
+                "content": "Other batch candidate",
+                "normalized_content": "other batch candidate",
+                "import_batch_id": uuid4(),
+                "source_external_id": "other-candidate",
+            }
+        )
+        await store.upsert_memory(other, ())
+        active = await store.activate_migration_batch(
+            tenant_id,
+            batch.id,
+            actor_id,
+            PersonaCore(
+                values="v",
+                boundaries="b",
+                tone="t",
+                initiative="i",
+                emotional_range="e",
+                disagreement="d",
+            ),
+        )
+        promoted = await store.get_memory(tenant_id, candidate.id)
+        assert active.state == "active"
+        assert promoted is not None
+        assert promoted.state is MemoryState.PROMOTED
+        assert promoted.confirmed is True
+        assert promoted.reviewed_at is not None
+        assert promoted.reviewed_by == actor_id
+        assert (await store.get_memory(tenant_id, other.id)).state is MemoryState.CANDIDATE  # type: ignore[union-attr]
+        events = await store.list_events(tenant_id)
+        assert any(
+            event.event_type is EventType.MEMORY_PROMOTED
+            and event.payload["memory_id"] == str(candidate.id)
+            for event in events
+        )
     finally:
         await store.close()

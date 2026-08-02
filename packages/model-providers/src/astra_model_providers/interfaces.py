@@ -29,7 +29,25 @@ class ModelCompletion(BaseModel):
     tool_calls: tuple[ToolCall, ...] = ()
 
 
+class PlannerTask(BaseModel):
+    """One bounded, read-only ARA operation proposed by the main model."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    objective: str
+    context: str = ""
+    required_capabilities: tuple[dict[str, str], ...]
+    deliverable_contract: str
+
+
+class PlannerDecision(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    tasks: tuple[PlannerTask, ...] = ()
+
+
 class MainModelProvider(Protocol):
+    async def plan(
+        self, messages: tuple[ModelMessage, ...], max_siblings: int
+    ) -> PlannerDecision: ...
     @overload
     async def complete(self, messages: tuple[ModelMessage, ...]) -> str: ...
 

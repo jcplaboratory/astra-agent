@@ -3,21 +3,25 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, NoReturn, Protocol
-from uuid import UUID
+from typing import Annotated, NoReturn, Protocol, cast
+from uuid import UUID, uuid4
 
 from astra_domain import (
     ActorType,
     Approval,
     ApprovalState,
     AuditEvent,
+    BackgroundJob,
+    BackgroundJobKind,
     Conversation,
     ConversationMessage,
     ConversationTurn,
     ConversationTurnState,
     EventType,
+    JobError,
     MemoryRecord,
     MemoryState,
+    PersonaProfile,
     RemoteAgent,
     Task,
     TaskState,
@@ -25,6 +29,7 @@ from astra_domain import (
 from astra_memory import (
     ContextCompiler,
     DeterministicMemoryExtractor,
+    LocalModelContextCompressor,
     MemoryContextCompiler,
     MemoryExtractor,
     MemoryPipeline,
@@ -32,7 +37,6 @@ from astra_memory import (
     NullVectorIndex,
     QdrantVectorIndex,
     VectorIndex,
-    deterministic_embedding,
 )
 from astra_model_providers import (
     DevelopmentModelProvider,
@@ -46,6 +50,8 @@ from astra_protocol import (
     ApprovalRequest,
     ApprovalResponse,
     ARAEventRequest,
+    ArtifactDownloadResponse,
+    ArtifactMetadataResponse,
     ArtifactUploadRequest,
     ArtifactUploadResponse,
     CancelTaskRequest,
@@ -55,11 +61,19 @@ from astra_protocol import (
     ConversationTurnResponse,
     ConversationTurnsResponse,
     CreateConversationRequest,
+    FailTaskRequest,
+    HeartbeatRequest,
+    HeartbeatResponse,
     LeaseRequest,
     LeaseResponse,
     MemoryExplanationResponse,
     MemoryListResponse,
     MemoryReviewRequest,
+    MigrationBatchResponse,
+    MigrationPersonaRequest,
+    PersonaResponse,
+    PersonaRevertRequest,
+    PersonaUpdateRequest,
     RegisterARARequest,
     RenewLeaseRequest,
     SendMessageRequest,
@@ -165,7 +179,7 @@ def create_app(
             engine = create_async_engine(settings.database_url, pool_pre_ping=True)
             if settings.create_schema_on_startup:
                 await create_schema(engine)
-            runtime_store = MariaDBRuntimeStore(engine)
+            runtime_store = cast(RuntimeStore, MariaDBRuntimeStore(engine))
         app.state.store = runtime_store or InMemoryRuntimeStore()
         app.state.settings = settings
         app.state.artifact_store = artifact_store
@@ -201,9 +215,17 @@ def create_app(
                 if settings.memory_backend == "qdrant"
                 else NullVectorIndex()
             )
+        try:
+            await app.state.vector_index.ensure_ready()
+        except Exception:
+            # The compiler falls back to lexical recall; vector jobs retain this index and retry.
+            logger.exception("Qdrant is unavailable; API will use lexical memory recall")
         app.state.local_model_provider = None
         extractor: MemoryExtractor = DeterministicMemoryExtractor()
-        if settings.memory_extractor_backend == "local_model":
+        if (
+            settings.memory_extractor_backend == "local_model"
+            or settings.context_compressor_backend == "local_model"
+        ):
             app.state.local_model_provider = OpenAICompatibleLocalModelProvider(
                 settings.local_model_url,
                 settings.local_model_name,
@@ -215,24 +237,36 @@ def create_app(
             extractor,
             app.state.vector_index,
         )
-        app.state.context_compiler = context_compiler or MemoryContextCompiler(
+        deterministic_compiler = MemoryContextCompiler(
             app.state.store,
             app.state.vector_index,
             settings.persona_kernel,
             settings.persona_max_tokens,
             settings.memory_max_records,
         )
+        if context_compiler is not None:
+            app.state.context_compiler = context_compiler
+        elif settings.context_compressor_backend == "local_model":
+            if app.state.local_model_provider is None:
+                raise RuntimeError("local context compression requires a local model provider")
+            app.state.context_compiler = LocalModelContextCompressor(
+                deterministic_compiler,
+                app.state.local_model_provider,
+                settings.persona_max_tokens,
+            )
+        else:
+            app.state.context_compiler = deterministic_compiler
         app.state.tool_registry = LocalToolRegistry(settings)
         app.state.orchestrator = ConversationOrchestrator(
             app.state.store,
             app.state.context_compiler,
             app.state.model_provider,
             settings.conversation_history_messages,
-            app.state.memory_pipeline,
             settings.delegation_wait_seconds,
             settings.delegation_poll_seconds,
             settings.delegation_enabled,
             app.state.tool_registry,
+            max_delegation_siblings=settings.delegation_max_siblings,
         )
         runner_tasks: dict[UUID, asyncio.Task[None]] = {}
 
@@ -259,13 +293,63 @@ def create_app(
             return task
 
         app.state.advance_turn = advance_turn
-        await app.state.vector_index.ensure_ready()
+
+        async def run_jobs() -> None:
+            while True:
+                job = await app.state.store.claim_job(
+                    uuid4(), datetime.now(UTC) + timedelta(minutes=5)
+                )
+                if job is None:
+                    await asyncio.sleep(0.1)
+                    continue
+                lease_id = job.lease_id
+                if lease_id is None:
+                    continue
+                try:
+                    if job.kind is BackgroundJobKind.MEMORY_EXTRACTION:
+                        records = await app.state.memory_pipeline.extract_message(
+                            job.tenant_id,
+                            UUID(str(job.payload["source_event_id"])),
+                            job.source_id,
+                            str(job.payload["content"]),
+                        )
+                        for record in records:
+                            if record.state is MemoryState.PROMOTED:
+                                await app.state.store.enqueue_job(
+                                    BackgroundJob(
+                                        tenant_id=job.tenant_id,
+                                        kind=BackgroundJobKind.VECTOR_SYNC,
+                                        source_id=record.id,
+                                    )
+                                )
+                    else:
+                        memory = await app.state.store.get_memory(job.tenant_id, job.source_id)
+                        if memory is not None:
+                            await app.state.memory_pipeline.sync_memory(memory)
+                    await app.state.store.complete_job(job.tenant_id, job.id, lease_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    delay = min(300, 2 ** min(job.attempt_count, 8))
+                    await app.state.store.retry_job(
+                        job.tenant_id,
+                        job.id,
+                        lease_id,
+                        JobError(
+                            type=type(error).__name__, message=str(error) or "background job failed"
+                        ),
+                        datetime.now(UTC) + timedelta(seconds=delay),
+                    )
+
+        job_runner = asyncio.create_task(run_jobs(), name="background-jobs")
         yield
         tasks = tuple(runner_tasks.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        job_runner.cancel()
+        await asyncio.gather(job_runner, return_exceptions=True)
         await app.state.vector_index.close()
         if app.state.local_model_provider is not None:
             await app.state.local_model_provider.close()
@@ -350,6 +434,25 @@ def create_app(
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
 
+    @ara_api.post("/heartbeat", response_model=HeartbeatResponse)
+    async def heartbeat(
+        body: HeartbeatRequest,
+        principal: Annotated[ARAPrincipal, Depends(principal_dependency)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> HeartbeatResponse:
+        if body.tenant_id != principal.tenant_id or body.ara_id != principal.ara_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "ARA identity mismatch")
+        try:
+            task = await runtime_store.heartbeat(
+                body.tenant_id, body.ara_id, body.task_id, body.lease_id
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+        return HeartbeatResponse(
+            task_state=task.state if task else None,
+            cancellation_requested=bool(task and task.state is TaskState.CANCELLING),
+        )
+
     @ara_api.post("/renew", response_model=LeaseResponse)
     async def renew_lease(
         body: RenewLeaseRequest,
@@ -369,7 +472,7 @@ def create_app(
             raise_lifecycle_error(error)
 
     async def finish(
-        body: CompleteTaskRequest | CancelTaskRequest,
+        body: CompleteTaskRequest | CancelTaskRequest | FailTaskRequest,
         principal: ARAPrincipal,
         runtime_store: RuntimeStore,
         task_state: TaskState,
@@ -425,6 +528,14 @@ def create_app(
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
     ) -> TaskLifecycleResponse:
         return await finish(body, principal, runtime_store, TaskState.CANCELLED, body.reason)
+
+    @ara_api.post("/fail", response_model=TaskLifecycleResponse)
+    async def fail_task(
+        body: FailTaskRequest,
+        principal: Annotated[ARAPrincipal, Depends(principal_dependency)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> TaskLifecycleResponse:
+        return await finish(body, principal, runtime_store, TaskState.FAILED, body.error)
 
     @ara_api.post("/approvals", response_model=ApprovalResponse, status_code=201)
     async def request_approval(
@@ -644,6 +755,188 @@ def create_app(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
         return await runtime_store.list_events(tenant_id)
 
+    @api.get("/tenants/{tenant_id}/jobs", response_model=list[BackgroundJob], tags=["jobs"])
+    async def list_jobs(
+        tenant_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> tuple[BackgroundJob, ...]:
+        if tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        return await runtime_store.list_jobs(tenant_id)
+
+    @api.get("/tenants/{tenant_id}/aras", response_model=list[RemoteAgent], tags=["aras"])
+    async def list_aras(
+        tenant_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> tuple[RemoteAgent, ...]:
+        if tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        return await runtime_store.list_remote_agents(tenant_id)
+
+    @api.get(
+        "/tenants/{tenant_id}/artifacts",
+        response_model=list[ArtifactMetadataResponse],
+        tags=["artifacts"],
+    )
+    async def list_artifacts(
+        tenant_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> list[ArtifactMetadataResponse]:
+        if tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        return [
+            ArtifactMetadataResponse(
+                **item.model_dump(exclude={"tenant_id", "object_key", "deleted_at"})
+            )
+            for item in await runtime_store.list_artifacts(tenant_id)
+        ]
+
+    @api.get(
+        "/artifacts/{artifact_id}", response_model=ArtifactMetadataResponse, tags=["artifacts"]
+    )
+    async def get_artifact(
+        artifact_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ArtifactMetadataResponse:
+        artifact = await runtime_store.get_artifact(principal.tenant_id, artifact_id)
+        if artifact is None or artifact.deleted_at is not None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found")
+        return ArtifactMetadataResponse(
+            **artifact.model_dump(exclude={"tenant_id", "object_key", "deleted_at"})
+        )
+
+    @api.post(
+        "/artifacts/{artifact_id}/download",
+        response_model=ArtifactDownloadResponse,
+        tags=["artifacts"],
+    )
+    async def download_artifact(
+        artifact_id: UUID,
+        request: Request,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ArtifactDownloadResponse:
+        artifact = await runtime_store.get_artifact(principal.tenant_id, artifact_id)
+        if artifact is None or artifact.deleted_at is not None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found")
+        target_store: ArtifactStore | None = request.app.state.artifact_store
+        if target_store is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "artifact storage unavailable")
+        target = target_store.prepare_download(artifact)
+        await runtime_store.append_event(
+            AuditEvent(
+                tenant_id=artifact.tenant_id,
+                event_type=EventType.ARTIFACT_DOWNLOADED,
+                actor_type=ActorType.USER,
+                actor_id=principal.user_id,
+                task_id=artifact.task_id,
+                payload={"artifact_id": str(artifact.id)},
+            )
+        )
+        return ArtifactDownloadResponse(
+            **artifact.model_dump(
+                exclude={"tenant_id", "object_key", "deleted_at", "retention_until"}
+            ),
+            download_url=target.download_url,
+            expires_in_seconds=target.expires_in_seconds,
+        )
+
+    @api.delete(
+        "/artifacts/{artifact_id}", response_model=ArtifactMetadataResponse, tags=["artifacts"]
+    )
+    async def delete_artifact(
+        artifact_id: UUID,
+        request: Request,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ArtifactMetadataResponse:
+        retention_until = datetime.now(UTC) + timedelta(days=30)
+        try:
+            artifact = await runtime_store.delete_artifact(
+                principal.tenant_id, artifact_id, principal.user_id, retention_until
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+        target_store: ArtifactStore | None = request.app.state.artifact_store
+        if target_store is not None:
+            target_store.delete(artifact)
+        return ArtifactMetadataResponse(
+            **artifact.model_dump(exclude={"tenant_id", "object_key", "deleted_at"})
+        )
+
+    @api.post("/tasks/{task_id}/cancel", response_model=TaskLifecycleResponse, tags=["tasks"])
+    async def request_task_cancellation(
+        task_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> TaskLifecycleResponse:
+        try:
+            task = await runtime_store.request_task_cancellation(
+                principal.tenant_id, task_id, principal.user_id
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+        return TaskLifecycleResponse(task_id=task.id, state=task.state)
+
+    @api.get("/tenants/{tenant_id}/persona", response_model=PersonaResponse, tags=["persona"])
+    async def get_persona(
+        tenant_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> PersonaResponse:
+        if tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        persona = await runtime_store.get_active_persona(tenant_id)
+        if persona is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "active persona not found")
+        return PersonaResponse(persona=persona)
+
+    @api.put("/tenants/{tenant_id}/persona", response_model=PersonaResponse, tags=["persona"])
+    async def update_persona(
+        tenant_id: UUID,
+        body: PersonaUpdateRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> PersonaResponse:
+        if tenant_id != principal.tenant_id or body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        active = await runtime_store.get_active_persona(tenant_id)
+        profile = PersonaProfile(
+            tenant_id=tenant_id,
+            version=(active.version if active is not None else 0) + 1,
+            authored_core=body.authored_core,
+        )
+        try:
+            return PersonaResponse(
+                persona=await runtime_store.create_persona_profile(profile, principal.user_id)
+            )
+        except LifecycleConflictError as error:
+            raise_lifecycle_error(error)
+
+    @api.post(
+        "/tenants/{tenant_id}/persona/revert", response_model=PersonaResponse, tags=["persona"]
+    )
+    async def revert_persona(
+        tenant_id: UUID,
+        body: PersonaRevertRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> PersonaResponse:
+        if tenant_id != principal.tenant_id or body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            return PersonaResponse(
+                persona=await runtime_store.revert_persona_profile(
+                    tenant_id, body.version, principal.user_id
+                )
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
     @api.get(
         "/tenants/{tenant_id}/memories",
         response_model=MemoryListResponse,
@@ -659,6 +952,72 @@ def create_app(
         return MemoryListResponse(
             memories=await runtime_store.list_memories(tenant_id, include_candidates=True)
         )
+
+    @api.get("/tenants/{tenant_id}/migration-batches", response_model=list[MigrationBatchResponse])
+    async def list_migration_batches(
+        tenant_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> list[MigrationBatchResponse]:
+        if tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        return [
+            MigrationBatchResponse(batch=item)
+            for item in await runtime_store.list_migration_batches(tenant_id)
+        ]
+
+    @api.post("/migration-batches/{batch_id}/activate", response_model=MigrationBatchResponse)
+    async def activate_migration_batch(
+        batch_id: UUID,
+        body: MigrationPersonaRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> MigrationBatchResponse:
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            batch = await runtime_store.activate_migration_batch(
+                body.tenant_id, batch_id, principal.user_id, body.authored_core
+            )
+            for memory in await runtime_store.list_memories(
+                body.tenant_id, include_candidates=False
+            ):
+                if memory.import_batch_id == batch_id:
+                    await runtime_store.enqueue_job(
+                        BackgroundJob(
+                            tenant_id=body.tenant_id,
+                            kind=BackgroundJobKind.VECTOR_SYNC,
+                            source_id=memory.id,
+                        )
+                    )
+            return MigrationBatchResponse(batch=batch)
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @api.post("/migration-batches/{batch_id}/rollback", response_model=MigrationBatchResponse)
+    async def rollback_migration_batch(
+        batch_id: UUID,
+        body: MigrationPersonaRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> MigrationBatchResponse:
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            batch, deleted = await runtime_store.rollback_migration_batch(
+                body.tenant_id, batch_id, principal.user_id
+            )
+            for memory in deleted:
+                await runtime_store.enqueue_job(
+                    BackgroundJob(
+                        tenant_id=body.tenant_id,
+                        kind=BackgroundJobKind.VECTOR_SYNC,
+                        source_id=memory.id,
+                    )
+                )
+            return MigrationBatchResponse(batch=batch)
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
 
     @api.get(
         "/memories/{memory_id}",
@@ -696,10 +1055,13 @@ def create_app(
             )
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
-        try:
-            await request.app.state.vector_index.delete(memory_id)
-        except Exception:
-            pass
+        await runtime_store.enqueue_job(
+            BackgroundJob(
+                tenant_id=principal.tenant_id,
+                kind=BackgroundJobKind.VECTOR_SYNC,
+                source_id=deleted.id,
+            )
+        )
         return deleted
 
     @api.post(
@@ -727,14 +1089,21 @@ def create_app(
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
         if reviewed.state is MemoryState.PROMOTED:
-            try:
-                await request.app.state.vector_index.upsert(
-                    reviewed, deterministic_embedding(reviewed.content)
+            await runtime_store.enqueue_job(
+                BackgroundJob(
+                    tenant_id=body.tenant_id,
+                    kind=BackgroundJobKind.VECTOR_SYNC,
+                    source_id=reviewed.id,
                 )
-                if body.replaces_memory_id is not None:
-                    await request.app.state.vector_index.delete(body.replaces_memory_id)
-            except Exception:
-                pass
+            )
+            if body.replaces_memory_id is not None:
+                await runtime_store.enqueue_job(
+                    BackgroundJob(
+                        tenant_id=body.tenant_id,
+                        kind=BackgroundJobKind.VECTOR_SYNC,
+                        source_id=body.replaces_memory_id,
+                    )
+                )
         return reviewed
 
     @api.get("/tenants/{tenant_id}/tasks", response_model=list[Task], tags=["tasks"])

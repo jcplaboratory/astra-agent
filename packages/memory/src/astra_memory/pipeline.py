@@ -13,6 +13,7 @@ from astra_domain import (
     MemoryKind,
     MemoryRecord,
     MemoryState,
+    PersonaProfile,
 )
 from astra_model_providers import LocalModelProvider
 
@@ -20,6 +21,7 @@ from astra_memory.compiler import ContextBriefing
 
 
 class MemoryRepository(Protocol):
+    async def get_active_persona(self, tenant_id: UUID) -> PersonaProfile | None: ...
     async def upsert_memory(
         self, memory: MemoryRecord, events: tuple[AuditEvent, ...]
     ) -> MemoryRecord: ...
@@ -264,7 +266,7 @@ class MemoryPipeline:
         self._extractor = extractor
         self._vector_index = vector_index
 
-    async def process_message(
+    async def extract_message(
         self, tenant_id: UUID, source_event_id: UUID, source_message_id: UUID, content: str
     ) -> tuple[MemoryRecord, ...]:
         records: list[MemoryRecord] = []
@@ -303,10 +305,14 @@ class MemoryPipeline:
                     )
                 )
             stored = await self._repository.upsert_memory(memory, tuple(events))
-            if stored.state is MemoryState.PROMOTED:
-                await self._vector_index.upsert(stored, deterministic_embedding(stored.content))
             records.append(stored)
         return tuple(records)
+
+    async def sync_memory(self, memory: MemoryRecord) -> None:
+        if memory.state is MemoryState.PROMOTED:
+            await self._vector_index.upsert(memory, deterministic_embedding(memory.content))
+        elif memory.state is MemoryState.DELETED:
+            await self._vector_index.delete(memory.id)
 
 
 class MemoryContextCompiler:
@@ -327,13 +333,17 @@ class MemoryContextCompiler:
     async def compile(self, tenant_id: UUID, objective: str) -> ContextBriefing:
         authorized = await self._repository.list_memories(tenant_id, include_candidates=False)
         by_id = {item.id: item for item in authorized if item.visibility == "private"}
-        ranked_ids = await self._vector_index.rank(
-            tenant_id,
-            "private",
-            tuple(by_id),
-            deterministic_embedding(objective),
-            self._memory_limit,
-        )
+        try:
+            ranked_ids = await self._vector_index.rank(
+                tenant_id,
+                "private",
+                tuple(by_id),
+                deterministic_embedding(objective),
+                self._memory_limit,
+            )
+        except Exception:
+            # Vector availability must not prevent a safe lexical recall.
+            ranked_ids = ()
         ranked = [by_id[item] for item in ranked_ids if item in by_id]
         if not ranked:
             terms = set(re.findall(r"[a-z0-9_]+", objective.casefold()))
@@ -344,7 +354,22 @@ class MemoryContextCompiler:
                 ),
                 reverse=True,
             )[: self._memory_limit]
-        sections = [f"Persona:\n{self._persona_kernel}"]
+        profile = await self._repository.get_active_persona(tenant_id)
+        persona = (
+            self._persona_kernel
+            if profile is None
+            else "\n".join(
+                (
+                    f"Values: {profile.authored_core.values}",
+                    f"Boundaries: {profile.authored_core.boundaries}",
+                    f"Tone: {profile.authored_core.tone}",
+                    f"Initiative: {profile.authored_core.initiative}",
+                    f"Emotional range: {profile.authored_core.emotional_range}",
+                    f"Disagreement: {profile.authored_core.disagreement}",
+                )
+            )
+        )
+        sections = [f"Persona:\n{persona}"]
         if ranked:
             sections.append(
                 "Relevant approved memory:\n"

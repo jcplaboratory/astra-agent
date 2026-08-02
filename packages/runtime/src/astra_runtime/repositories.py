@@ -7,11 +7,17 @@ from astra_domain import (
     ApprovalState,
     Artifact,
     AuditEvent,
+    BackgroundJob,
     Conversation,
     ConversationMessage,
     ConversationTurn,
+    JobAttempt,
+    JobError,
+    LearnedPersonaAdaptation,
     Lease,
     MemoryRecord,
+    MigrationBatch,
+    PersonaProfile,
     RemoteAgent,
     Task,
     TaskState,
@@ -32,6 +38,49 @@ class LifecycleConflictError(LifecycleError):
 
 
 class RuntimeStore(Protocol):
+    async def stage_migration_batch(
+        self, batch: MigrationBatch, memories: tuple[MemoryRecord, ...], actor_id: UUID
+    ) -> MigrationBatch: ...
+    async def get_migration_batch(
+        self, tenant_id: UUID, batch_id: UUID
+    ) -> MigrationBatch | None: ...
+    async def list_migration_batches(self, tenant_id: UUID) -> tuple[MigrationBatch, ...]: ...
+    async def activate_migration_batch(
+        self, tenant_id: UUID, batch_id: UUID, actor_id: UUID, authored_core: object
+    ) -> MigrationBatch: ...
+    async def rollback_migration_batch(
+        self, tenant_id: UUID, batch_id: UUID, actor_id: UUID
+    ) -> tuple[MigrationBatch, tuple[MemoryRecord, ...]]: ...
+    async def enqueue_job(self, job: BackgroundJob) -> BackgroundJob: ...
+    async def claim_job(
+        self, lease_id: UUID, lease_expires_at: datetime
+    ) -> BackgroundJob | None: ...
+    async def complete_job(
+        self, tenant_id: UUID, job_id: UUID, lease_id: UUID
+    ) -> BackgroundJob: ...
+    async def retry_job(
+        self, tenant_id: UUID, job_id: UUID, lease_id: UUID, error: JobError, available_at: datetime
+    ) -> BackgroundJob: ...
+    async def list_jobs(self, tenant_id: UUID) -> tuple[BackgroundJob, ...]: ...
+    async def list_job_attempts(self, tenant_id: UUID, job_id: UUID) -> tuple[JobAttempt, ...]: ...
+    async def get_active_persona(self, tenant_id: UUID) -> PersonaProfile | None: ...
+
+    async def create_persona_profile(
+        self, profile: PersonaProfile, actor_id: UUID
+    ) -> PersonaProfile: ...
+
+    async def revert_persona_profile(
+        self, tenant_id: UUID, version: int, actor_id: UUID
+    ) -> PersonaProfile: ...
+
+    async def create_learned_persona_adaptation(
+        self, adaptation: LearnedPersonaAdaptation
+    ) -> LearnedPersonaAdaptation: ...
+
+    async def reverse_learned_persona_adaptation(
+        self, tenant_id: UUID, adaptation_id: UUID
+    ) -> LearnedPersonaAdaptation: ...
+
     async def upsert_memory(
         self, memory: MemoryRecord, events: tuple[AuditEvent, ...]
     ) -> MemoryRecord: ...
@@ -78,6 +127,7 @@ class RuntimeStore(Protocol):
         user_message: ConversationMessage,
         turn: ConversationTurn,
         events: tuple[AuditEvent, ...],
+        extraction_job: BackgroundJob,
     ) -> ConversationTurn: ...
 
     async def get_turn(self, tenant_id: UUID, turn_id: UUID) -> ConversationTurn | None: ...
@@ -99,6 +149,16 @@ class RuntimeStore(Protocol):
     ) -> ConversationTurn: ...
 
     async def create_tool_invocation(self, invocation: ToolInvocation) -> ToolInvocation: ...
+
+    async def create_delegated_tasks(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        tasks: tuple[Task, ...],
+        invocations: tuple[ToolInvocation, ...],
+        checkpoint: dict[str, Any],
+    ) -> tuple[Task, ...]: ...
 
     async def get_tool_invocation(
         self, tenant_id: UUID, turn_id: UUID, tool_call_id: str
@@ -127,6 +187,22 @@ class RuntimeStore(Protocol):
     async def add_task(self, task: Task, event: AuditEvent) -> Task: ...
 
     async def get_task(self, tenant_id: UUID, task_id: UUID) -> Task | None: ...
+    async def request_task_cancellation(
+        self, tenant_id: UUID, task_id: UUID, actor_id: UUID
+    ) -> Task: ...
+    async def heartbeat(
+        self,
+        tenant_id: UUID,
+        ara_id: UUID,
+        task_id: UUID | None = None,
+        lease_id: UUID | None = None,
+    ) -> Task | None: ...
+    async def list_remote_agents(self, tenant_id: UUID) -> tuple[RemoteAgent, ...]: ...
+    async def get_artifact(self, tenant_id: UUID, artifact_id: UUID) -> Artifact | None: ...
+    async def list_artifacts(self, tenant_id: UUID) -> tuple[Artifact, ...]: ...
+    async def delete_artifact(
+        self, tenant_id: UUID, artifact_id: UUID, actor_id: UUID, retention_until: datetime
+    ) -> Artifact: ...
 
     async def lease_task(
         self, tenant_id: UUID, ara_id: UUID, expires_at: datetime

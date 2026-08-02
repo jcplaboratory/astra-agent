@@ -16,7 +16,9 @@ class AstraAgentApp(App[None]):
     #workspace { height: 1fr; }
     #conversation { width: 2fr; border: solid #3b82f6; padding: 1; }
     #side { width: 1fr; }
-    #tasks, #approvals, #memories { height: 1fr; border: solid #64748b; padding: 1; }
+    #tasks, #approvals, #memories, #jobs, #persona, #aras, #artifacts {
+        height: 1fr; border: solid #64748b; padding: 1;
+    }
     #approvals { border: solid #d97706; }
     #memories { border: solid #8b5cf6; }
     Input { dock: bottom; margin: 1 2; }
@@ -52,6 +54,19 @@ class AstraAgentApp(App[None]):
                     with Horizontal():
                         yield Button("Promote", id="promote-memory", disabled=True)
                         yield Button("Reject", id="reject-memory", disabled=True)
+                with Vertical(id="jobs"):
+                    yield Label("Background Jobs", classes="title")
+                    yield Static("No failed jobs", id="job-list")
+                with Vertical(id="persona"):
+                    yield Label("Active Persona", classes="title")
+                    yield Static("Loading...", id="persona-list")
+                with Vertical(id="aras"):
+                    yield Label("ARA Health", classes="title")
+                    yield Static("Loading...", id="ara-list")
+                with Vertical(id="artifacts"):
+                    yield Label("Artifacts", classes="title")
+                    yield Static("No artifacts", id="artifact-list")
+                    yield Button("Download latest", id="download-artifact", disabled=True)
         yield Input(placeholder="Message Astra", id="message-input", disabled=True)
         yield Footer()
 
@@ -66,6 +81,7 @@ class AstraAgentApp(App[None]):
         self.candidate_memory_id: str | None = None
         self.active_turn_id: str | None = None
         self.active_turn_paused = False
+        self.latest_artifact_id: str | None = None
         status = self.query_one("#status", Static)
         if not self.access_token and settings.tui_dev_login:
             try:
@@ -84,7 +100,7 @@ class AstraAgentApp(App[None]):
             health = response.json()
             summary = f"API {health['version']} | {health['persistence']} persistence"
             status.update(f"Astra Agent: online | {summary}")
-        except (httpx.HTTPError, KeyError, ValueError) as error:
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
             status.update(f"Astra Agent: unavailable | {error}")
         await self.refresh_activity()
         message_input = self.query_one("#message-input", Input)
@@ -137,15 +153,32 @@ class AstraAgentApp(App[None]):
                 tasks_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/tasks")
                 approvals_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/approvals")
                 memories_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/memories")
+                jobs_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/jobs")
+                persona_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/persona")
+                aras_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/aras")
+                artifacts_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/artifacts")
                 tasks_response.raise_for_status()
                 approvals_response.raise_for_status()
                 memories_response.raise_for_status()
+                jobs_response.raise_for_status()
+                persona_response.raise_for_status()
+                aras_response.raise_for_status()
+                artifacts_response.raise_for_status()
             tasks = tasks_response.json()
             approvals = [item for item in approvals_response.json() if item["state"] == "pending"]
             memories = memories_response.json()["memories"]
+            failures = [item for item in jobs_response.json() if item["state"] == "failed"]
+            persona = persona_response.json()["persona"]
+            aras = aras_response.json()
+            artifacts = artifacts_response.json()
             candidates = [item for item in memories if item["state"] == "candidate"]
             self.candidate_memory_id = candidates[0]["id"] if candidates else None
-            task_lines = [f"{item['state']:>9}  {item['objective']}" for item in tasks[-8:]]
+            task_lines = [
+                f"{item['state']:>9}  {item['objective']}"
+                + (f" [{item['target_ara_id'][:8]}]" if item.get("target_ara_id") else "")
+                + (" [partial failure]" if item["state"] in {"failed", "cancelled"} else "")
+                for item in tasks[-8:]
+            ]
             self.query_one("#task-list", Static).update("\n".join(task_lines) or "No tasks")
             self.pending_approval_id = approvals[0]["id"] if approvals else None
             if approvals:
@@ -158,14 +191,28 @@ class AstraAgentApp(App[None]):
             self.query_one("#memory-list", Static).update(
                 "\n".join(memory_lines) or "No approved memory"
             )
+            failure_lines = [
+                f"{item['kind']}: {item.get('last_error', {}).get('message', 'failed')}"
+                for item in failures[:3]
+            ]
+            self.query_one("#job-list", Static).update("\n".join(failure_lines) or "No failed jobs")
+            self.query_one("#persona-list", Static).update(f"Version {persona['version']}")
+            ara_lines = [f"{item['status']:>8}  {item['name']}" for item in aras[-5:]]
+            self.query_one("#ara-list", Static).update("\n".join(ara_lines) or "No registered ARAs")
+            self.latest_artifact_id = artifacts[-1]["id"] if artifacts else None
+            artifact_lines = [item["name"] for item in artifacts[-5:]]
+            self.query_one("#artifact-list", Static).update(
+                "\n".join(artifact_lines) or "No artifacts"
+            )
+            self.query_one("#download-artifact", Button).disabled = self.latest_artifact_id is None
             can_review = bool(self.candidate_memory_id and (self.user_id or self.access_token))
             self.query_one("#promote-memory", Button).disabled = not can_review
             self.query_one("#reject-memory", Button).disabled = not can_review
             enabled = bool(self.pending_approval_id and (self.user_id or self.access_token))
             self.query_one("#grant", Button).disabled = not enabled
             self.query_one("#deny", Button).disabled = not enabled
-        except (httpx.HTTPError, KeyError, ValueError):
-            pass
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
+            self.query_one("#job-list", Static).update(f"Status unavailable: {error}")
         await self._refresh_active_turn()
         inline_enabled = bool(enabled and self.active_turn_paused)
         self.query_one("#grant-inline", Button).disabled = not inline_enabled
@@ -198,6 +245,9 @@ class AstraAgentApp(App[None]):
             return
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "download-artifact":
+            await self._download_artifact()
+            return
         if event.button.id in {"promote-memory", "reject-memory"}:
             await self._review_memory(event.button.id == "promote-memory")
             return
@@ -237,6 +287,25 @@ class AstraAgentApp(App[None]):
             await self.refresh_activity()
         except httpx.HTTPError:
             return
+
+    async def _download_artifact(self) -> None:
+        if not self.latest_artifact_id:
+            return
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=3, headers=self._user_headers()
+            ) as client:
+                response = await client.post(
+                    f"/api/v1/artifacts/{self.latest_artifact_id}/download"
+                )
+                response.raise_for_status()
+            payload = response.json()
+            self.query_one("#conversation-log", RichLog).write(
+                f"[bold #86efac]Artifact URL ({payload['expires_in_seconds']}s)[/]: "
+                f"{payload['download_url']}"
+            )
+        except (httpx.HTTPError, KeyError, ValueError) as error:
+            self.query_one("#artifact-list", Static).update(f"Download failed: {error}")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         content = event.value.strip()

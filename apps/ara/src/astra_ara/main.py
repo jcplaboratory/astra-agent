@@ -3,7 +3,15 @@ import asyncio
 import httpx
 from astra_ara_sdk import ARAClient
 from astra_domain import Capability, CapabilityKind
-from astra_protocol import ARAEventRequest, CompleteTaskRequest, RegisterARARequest
+from astra_protocol import (
+    ARAEventRequest,
+    CancelTaskRequest,
+    CompleteTaskRequest,
+    FailTaskRequest,
+    HeartbeatRequest,
+    RegisterARARequest,
+    RenewLeaseRequest,
+)
 
 from astra_ara.executor import ARARepositoryExecutor
 from astra_ara.settings import ARASettings
@@ -50,8 +58,30 @@ async def serve(settings: ARASettings) -> None:
             await client.progress(
                 ARAEventRequest(**bound, message="Inspecting repository", progress_percent=10)
             )
-            result = await asyncio.to_thread(executor.execute, leased.task)
-            await client.complete(CompleteTaskRequest(**bound, result=result))
+            execution = asyncio.create_task(asyncio.to_thread(executor.execute, leased.task))
+            try:
+                while not execution.done():
+                    await asyncio.sleep(30)
+                    health = await client.heartbeat(HeartbeatRequest(**bound))
+                    if health.cancellation_requested:
+                        execution.cancel()
+                        await client.cancel(
+                            CancelTaskRequest(
+                                **bound, reason="Cancellation requested by control plane"
+                            )
+                        )
+                        break
+                    renewed = await client.renew(RenewLeaseRequest(**bound, duration_seconds=120))
+                    bound["lease_id"] = renewed.lease.id
+                if not execution.cancelled():
+                    result = await execution
+                    await client.complete(CompleteTaskRequest(**bound, result=result))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await client.fail(
+                    FailTaskRequest(**bound, error=f"{type(error).__name__}: {error}")
+                )
             if settings.once:
                 return
     finally:

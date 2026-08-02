@@ -3,6 +3,8 @@ from astra_model_providers.interfaces import (
     MainModelProvider,
     ModelCompletion,
     ModelMessage,
+    PlannerDecision,
+    PlannerTask,
     ToolCall,
     ToolDefinition,
 )
@@ -20,6 +22,8 @@ __all__ = [
     "ModelCompletion",
     "ModelMessage",
     "ModelProviderError",
+    "PlannerDecision",
+    "PlannerTask",
     "OpenAICompatibleLocalModelProvider",
     "OpenRouterModelProvider",
     "ToolCall",

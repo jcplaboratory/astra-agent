@@ -9,16 +9,27 @@ from astra_domain import (
     ApprovalState,
     Artifact,
     AuditEvent,
+    BackgroundJob,
+    BackgroundJobState,
     Conversation,
     ConversationMessage,
     ConversationTurn,
     ConversationTurnState,
     EventType,
+    JobAttempt,
+    JobError,
+    LearnedAdaptationState,
+    LearnedPersonaAdaptation,
     Lease,
     MemoryRecord,
     MemoryState,
     MessageRole,
+    MigrationBatch,
+    MigrationBatchState,
+    PersonaCore,
+    PersonaProfile,
     RemoteAgent,
+    RemoteAgentStatus,
     Task,
     TaskState,
     ToolInvocation,
@@ -37,12 +48,296 @@ class InMemoryRuntimeStore:
         self._turns: dict[UUID, ConversationTurn] = {}
         self._tool_invocations: dict[UUID, ToolInvocation] = {}
         self._memories: dict[UUID, MemoryRecord] = {}
+        self._migration_batches: dict[UUID, MigrationBatch] = {}
+        self._personas: dict[UUID, PersonaProfile] = {}
+        self._active_persona_ids: dict[UUID, UUID] = {}
+        self._learned_adaptations: dict[UUID, LearnedPersonaAdaptation] = {}
         self._tasks: dict[UUID, Task] = {}
         self._leases: dict[UUID, Lease] = {}
         self._events: list[AuditEvent] = []
+        self._jobs: dict[UUID, BackgroundJob] = {}
+        self._job_attempts: dict[UUID, list[JobAttempt]] = {}
         self._approvals: dict[UUID, Approval] = {}
         self._artifacts: dict[UUID, Artifact] = {}
         self._lock = asyncio.Lock()
+
+    async def stage_migration_batch(
+        self, batch: MigrationBatch, memories: tuple[MemoryRecord, ...], actor_id: UUID
+    ) -> MigrationBatch:
+        async with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in self._migration_batches.values()
+                    if item.tenant_id == batch.tenant_id
+                    and item.source_system == batch.source_system
+                    and item.source_database_fingerprint == batch.source_database_fingerprint
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            conversation = Conversation(
+                tenant_id=batch.tenant_id,
+                user_id=actor_id,
+                title=f"Imported {batch.source_system} migration",
+            )
+            message = ConversationMessage(
+                tenant_id=batch.tenant_id,
+                conversation_id=conversation.id,
+                role=MessageRole.USER,
+                content="Imported source provenance",
+            )
+            self._conversations[conversation.id] = conversation
+            self._messages[message.id] = message
+            self._migration_batches[batch.id] = batch
+            for memory in memories:
+                duplicate = next(
+                    (
+                        item
+                        for item in self._memories.values()
+                        if item.tenant_id == batch.tenant_id
+                        and item.source_system == memory.source_system
+                        and item.source_database_fingerprint == memory.source_database_fingerprint
+                        and item.source_external_id == memory.source_external_id
+                    ),
+                    None,
+                )
+                if duplicate is None:
+                    stored = memory.model_copy(update={"source_message_id": message.id})
+                    self._memories[stored.id] = stored
+                    self._events.append(
+                        AuditEvent(
+                            tenant_id=batch.tenant_id,
+                            event_type=EventType.MEMORY_CANDIDATE_CREATED,
+                            actor_type=ActorType.USER,
+                            actor_id=actor_id,
+                            payload={"memory_id": str(stored.id), "import_batch_id": str(batch.id)},
+                        )
+                    )
+            self._events.append(
+                AuditEvent(
+                    tenant_id=batch.tenant_id,
+                    event_type=EventType.MIGRATION_STAGED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"batch_id": str(batch.id)},
+                )
+            )
+            return batch
+
+    async def get_migration_batch(self, tenant_id: UUID, batch_id: UUID) -> MigrationBatch | None:
+        async with self._lock:
+            batch = self._migration_batches.get(batch_id)
+            return batch if batch is not None and batch.tenant_id == tenant_id else None
+
+    async def list_migration_batches(self, tenant_id: UUID) -> tuple[MigrationBatch, ...]:
+        async with self._lock:
+            return tuple(
+                item for item in self._migration_batches.values() if item.tenant_id == tenant_id
+            )
+
+    async def activate_migration_batch(
+        self, tenant_id: UUID, batch_id: UUID, actor_id: UUID, authored_core: object
+    ) -> MigrationBatch:
+        if not isinstance(authored_core, PersonaCore):
+            raise LifecycleConflictError("authored persona core is required")
+        async with self._lock:
+            batch = self._migration_batches.get(batch_id)
+            if batch is None or batch.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("migration batch not found")
+            if batch.state is not MigrationBatchState.STAGED:
+                raise LifecycleConflictError("migration batch is not staged")
+            memories = [
+                item
+                for item in self._memories.values()
+                if item.tenant_id == tenant_id and item.import_batch_id == batch_id
+            ]
+            if not memories or not any(
+                item.state in {MemoryState.CANDIDATE, MemoryState.PROMOTED} for item in memories
+            ):
+                raise LifecycleConflictError("an approved imported fact is required")
+            now = datetime.now(UTC)
+            promoted = [item for item in memories if item.state is MemoryState.CANDIDATE]
+            for item in promoted:
+                self._memories[item.id] = item.model_copy(
+                    update={
+                        "state": MemoryState.PROMOTED,
+                        "confirmed": True,
+                        "reviewed_at": now,
+                        "reviewed_by": actor_id,
+                        "updated_at": now,
+                    }
+                )
+            version = (
+                max(
+                    (
+                        item.version
+                        for item in self._personas.values()
+                        if item.tenant_id == tenant_id
+                    ),
+                    default=0,
+                )
+                + 1
+            )
+            profile = PersonaProfile(
+                tenant_id=tenant_id, version=version, authored_core=authored_core
+            )
+            self._personas[profile.id] = profile
+            self._active_persona_ids[tenant_id] = profile.id
+            active = batch.model_copy(
+                update={
+                    "state": MigrationBatchState.ACTIVE,
+                    "persona_profile_id": profile.id,
+                    "activated_at": now,
+                }
+            )
+            self._migration_batches[batch_id] = active
+            self._events.extend(
+                [
+                    *(
+                        AuditEvent(
+                            tenant_id=tenant_id,
+                            event_type=EventType.MEMORY_PROMOTED,
+                            actor_type=ActorType.USER,
+                            actor_id=actor_id,
+                            payload={"memory_id": str(item.id), "import_batch_id": str(batch_id)},
+                        )
+                        for item in promoted
+                    ),
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.MIGRATION_ACTIVATED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"batch_id": str(batch_id)},
+                    ),
+                ]
+            )
+            return active
+
+    async def rollback_migration_batch(
+        self, tenant_id: UUID, batch_id: UUID, actor_id: UUID
+    ) -> tuple[MigrationBatch, tuple[MemoryRecord, ...]]:
+        async with self._lock:
+            batch = self._migration_batches.get(batch_id)
+            if batch is None or batch.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("migration batch not found")
+            if batch.state is MigrationBatchState.ROLLED_BACK:
+                raise LifecycleConflictError("migration batch is already rolled back")
+            now = datetime.now(UTC)
+            deleted = tuple(
+                item.model_copy(
+                    update={"state": MemoryState.DELETED, "deleted_at": now, "updated_at": now}
+                )
+                for item in self._memories.values()
+                if item.import_batch_id == batch_id and item.state is not MemoryState.DELETED
+            )
+            for item in deleted:
+                self._memories[item.id] = item
+            rolled = batch.model_copy(
+                update={"state": MigrationBatchState.ROLLED_BACK, "rolled_back_at": now}
+            )
+            self._migration_batches[batch_id] = rolled
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.MIGRATION_ROLLED_BACK,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"batch_id": str(batch_id)},
+                )
+            )
+            return rolled, deleted
+
+    async def get_active_persona(self, tenant_id: UUID) -> PersonaProfile | None:
+        async with self._lock:
+            profile_id = self._active_persona_ids.get(tenant_id)
+            return self._personas.get(profile_id) if profile_id is not None else None
+
+    async def create_persona_profile(
+        self, profile: PersonaProfile, actor_id: UUID
+    ) -> PersonaProfile:
+        async with self._lock:
+            versions = [
+                item.version
+                for item in self._personas.values()
+                if item.tenant_id == profile.tenant_id
+            ]
+            if profile.version != (max(versions, default=0) + 1):
+                raise LifecycleConflictError("persona version is not next for tenant")
+            self._personas[profile.id] = profile
+            self._active_persona_ids[profile.tenant_id] = profile.id
+            self._events.extend(
+                (
+                    AuditEvent(
+                        tenant_id=profile.tenant_id,
+                        event_type=EventType.PERSONA_CREATED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"persona_id": str(profile.id), "version": profile.version},
+                    ),
+                    AuditEvent(
+                        tenant_id=profile.tenant_id,
+                        event_type=EventType.PERSONA_ACTIVATED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"persona_id": str(profile.id), "version": profile.version},
+                    ),
+                )
+            )
+            return profile
+
+    async def revert_persona_profile(
+        self, tenant_id: UUID, version: int, actor_id: UUID
+    ) -> PersonaProfile:
+        async with self._lock:
+            profile = next(
+                (
+                    item
+                    for item in self._personas.values()
+                    if item.tenant_id == tenant_id and item.version == version
+                ),
+                None,
+            )
+            if profile is None:
+                raise LifecycleNotFoundError("persona version not found")
+            self._active_persona_ids[tenant_id] = profile.id
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.PERSONA_REVERTED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"persona_id": str(profile.id), "version": version},
+                )
+            )
+            return profile
+
+    async def create_learned_persona_adaptation(
+        self, adaptation: LearnedPersonaAdaptation
+    ) -> LearnedPersonaAdaptation:
+        async with self._lock:
+            profile = self._personas.get(adaptation.profile_id)
+            if profile is None or profile.tenant_id != adaptation.tenant_id:
+                raise LifecycleNotFoundError("persona profile not found")
+            self._learned_adaptations[adaptation.id] = adaptation
+            return adaptation
+
+    async def reverse_learned_persona_adaptation(
+        self, tenant_id: UUID, adaptation_id: UUID
+    ) -> LearnedPersonaAdaptation:
+        async with self._lock:
+            adaptation = self._learned_adaptations.get(adaptation_id)
+            if adaptation is None or adaptation.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("learned persona adaptation not found")
+            if adaptation.state is LearnedAdaptationState.REVERSED:
+                raise LifecycleConflictError("learned persona adaptation is already reversed")
+            reversed_adaptation = adaptation.model_copy(
+                update={"state": LearnedAdaptationState.REVERSED, "reversed_at": datetime.now(UTC)}
+            )
+            self._learned_adaptations[adaptation_id] = reversed_adaptation
+            return reversed_adaptation
 
     async def upsert_memory(
         self, memory: MemoryRecord, events: tuple[AuditEvent, ...]
@@ -63,6 +358,131 @@ class InMemoryRuntimeStore:
             self._memories[memory.id] = memory
             self._events.extend(events)
             return memory
+
+    async def enqueue_job(self, job: BackgroundJob) -> BackgroundJob:
+        async with self._lock:
+            existing = next(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.tenant_id == job.tenant_id
+                    and item.kind == job.kind
+                    and item.source_id == job.source_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            self._jobs[job.id] = job
+            return job
+
+    async def claim_job(self, lease_id: UUID, lease_expires_at: datetime) -> BackgroundJob | None:
+        async with self._lock:
+            now = datetime.now(UTC)
+            job = next(
+                (
+                    item
+                    for item in sorted(self._jobs.values(), key=lambda value: value.created_at)
+                    if (
+                        item.state in {BackgroundJobState.PENDING, BackgroundJobState.RETRY}
+                        and item.available_at <= now
+                    )
+                    or (
+                        item.state is BackgroundJobState.RUNNING
+                        and item.lease_expires_at is not None
+                        and item.lease_expires_at <= now
+                    )
+                ),
+                None,
+            )
+            if job is None:
+                return None
+            claimed = job.model_copy(
+                update={
+                    "state": BackgroundJobState.RUNNING,
+                    "attempt_count": job.attempt_count + 1,
+                    "lease_id": lease_id,
+                    "lease_expires_at": lease_expires_at,
+                    "updated_at": now,
+                }
+            )
+            self._jobs[job.id] = claimed
+            self._job_attempts.setdefault(job.id, []).append(
+                JobAttempt(tenant_id=job.tenant_id, job_id=job.id, attempt=claimed.attempt_count)
+            )
+            return claimed
+
+    def _active_job(self, tenant_id: UUID, job_id: UUID, lease_id: UUID) -> BackgroundJob:
+        job = self._jobs.get(job_id)
+        if job is None or job.tenant_id != tenant_id:
+            raise LifecycleNotFoundError("job not found")
+        if job.state is not BackgroundJobState.RUNNING or job.lease_id != lease_id:
+            raise LifecycleConflictError("job is not actively claimed")
+        return job
+
+    async def complete_job(self, tenant_id: UUID, job_id: UUID, lease_id: UUID) -> BackgroundJob:
+        async with self._lock:
+            job = self._active_job(tenant_id, job_id, lease_id)
+            now = datetime.now(UTC)
+            completed = job.model_copy(
+                update={
+                    "state": BackgroundJobState.COMPLETED,
+                    "lease_id": None,
+                    "lease_expires_at": None,
+                    "completed_at": now,
+                    "updated_at": now,
+                }
+            )
+            self._jobs[job_id] = completed
+            self._job_attempts[job_id][-1] = self._job_attempts[job_id][-1].model_copy(
+                update={"finished_at": now}
+            )
+            return completed
+
+    async def retry_job(
+        self, tenant_id: UUID, job_id: UUID, lease_id: UUID, error: JobError, available_at: datetime
+    ) -> BackgroundJob:
+        async with self._lock:
+            job = self._active_job(tenant_id, job_id, lease_id)
+            now = datetime.now(UTC)
+            state = (
+                BackgroundJobState.FAILED
+                if job.attempt_count >= job.max_attempts
+                else BackgroundJobState.RETRY
+            )
+            retried = job.model_copy(
+                update={
+                    "state": state,
+                    "lease_id": None,
+                    "lease_expires_at": None,
+                    "last_error": error,
+                    "available_at": available_at,
+                    "completed_at": now if state is BackgroundJobState.FAILED else None,
+                    "updated_at": now,
+                }
+            )
+            self._jobs[job_id] = retried
+            self._job_attempts[job_id][-1] = self._job_attempts[job_id][-1].model_copy(
+                update={"finished_at": now, "error": error}
+            )
+            return retried
+
+    async def list_jobs(self, tenant_id: UUID) -> tuple[BackgroundJob, ...]:
+        async with self._lock:
+            return tuple(
+                item
+                for item in sorted(
+                    self._jobs.values(), key=lambda value: value.created_at, reverse=True
+                )
+                if item.tenant_id == tenant_id
+            )
+
+    async def list_job_attempts(self, tenant_id: UUID, job_id: UUID) -> tuple[JobAttempt, ...]:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.tenant_id != tenant_id:
+                return ()
+            return tuple(self._job_attempts.get(job_id, ()))
 
     async def get_memory(self, tenant_id: UUID, memory_id: UUID) -> MemoryRecord | None:
         async with self._lock:
@@ -237,6 +657,7 @@ class InMemoryRuntimeStore:
         user_message: ConversationMessage,
         turn: ConversationTurn,
         events: tuple[AuditEvent, ...],
+        extraction_job: BackgroundJob,
     ) -> ConversationTurn:
         async with self._lock:
             existing = next(
@@ -266,6 +687,7 @@ class InMemoryRuntimeStore:
                 update={"updated_at": user_message.created_at}
             )
             self._events.extend(events)
+            self._jobs[extraction_job.id] = extraction_job
             return turn
 
     async def get_turn(self, tenant_id: UUID, turn_id: UUID) -> ConversationTurn | None:
@@ -407,6 +829,92 @@ class InMemoryRuntimeStore:
                 )
             )
             return invocation
+
+    def _eligible_aras(self, tenant_id: UUID, task: Task) -> list[RemoteAgent]:
+        now = datetime.now(UTC)
+        busy = {lease.ara_id for lease in self._leases.values() if lease.expires_at > now}
+        return sorted(
+            (
+                ara
+                for ara in self._remote_agents.values()
+                if ara.tenant_id == tenant_id
+                and ara.status is RemoteAgentStatus.ACTIVE
+                and ara.trust_level > 0
+                and now - ara.last_seen_at <= timedelta(minutes=2)
+                and ara.id not in busy
+                and all(capability in ara.capabilities for capability in task.required_capabilities)
+            ),
+            key=lambda ara: (-ara.trust_level, ara.id.hex),
+        )
+
+    async def create_delegated_tasks(
+        self,
+        tenant_id: UUID,
+        turn_id: UUID,
+        run_lease_id: UUID,
+        tasks: tuple[Task, ...],
+        invocations: tuple[ToolInvocation, ...],
+        checkpoint: dict[str, Any],
+    ) -> tuple[Task, ...]:
+        if len(tasks) != len(invocations) or not tasks:
+            raise LifecycleConflictError("delegation tasks and invocations must match")
+        async with self._lock:
+            self._active_turn(tenant_id, turn_id, run_lease_id)
+            selected: set[UUID] = set()
+            assigned: list[Task] = []
+            for task in tasks:
+                candidates = [
+                    ara for ara in self._eligible_aras(tenant_id, task) if ara.id not in selected
+                ]
+                if not candidates:
+                    raise LifecycleConflictError("no eligible trusted ARA for planned task")
+                selected.add(candidates[0].id)
+                assigned.append(task.model_copy(update={"target_ara_id": candidates[0].id}))
+            now = datetime.now(UTC)
+            for task, invocation in zip(assigned, invocations, strict=True):
+                if invocation.task_id != task.id or invocation.turn_id != turn_id:
+                    raise LifecycleConflictError("delegation invocation ownership mismatch")
+                self._tasks[task.id] = task
+                self._tool_invocations[invocation.id] = invocation
+                self._events.extend(
+                    (
+                        AuditEvent(
+                            tenant_id=tenant_id,
+                            event_type=EventType.TASK_CREATED,
+                            actor_type=ActorType.COORDINATOR,
+                            task_id=task.id,
+                            payload={
+                                "turn_id": str(turn_id),
+                                "target_ara_id": str(task.target_ara_id),
+                            },
+                        ),
+                        AuditEvent(
+                            tenant_id=tenant_id,
+                            event_type=EventType.TOOL_INVOCATION_REQUESTED,
+                            actor_type=ActorType.COORDINATOR,
+                            payload={"invocation_id": str(invocation.id)},
+                        ),
+                    )
+                )
+            turn = self._turns[turn_id]
+            self._turns[turn_id] = turn.model_copy(
+                update={
+                    "state": ConversationTurnState.PAUSED,
+                    "checkpoint": checkpoint,
+                    "run_lease_id": None,
+                    "run_lease_expires_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.CONVERSATION_TURN_PAUSED,
+                    actor_type=ActorType.COORDINATOR,
+                    payload={"turn_id": str(turn_id)},
+                )
+            )
+            return tuple(assigned)
 
     async def get_tool_invocation(
         self, tenant_id: UUID, turn_id: UUID, tool_call_id: str
@@ -570,6 +1078,114 @@ class InMemoryRuntimeStore:
                 return None
             return task
 
+    async def request_task_cancellation(
+        self, tenant_id: UUID, task_id: UUID, actor_id: UUID
+    ) -> Task:
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("task not found")
+            if task.state is not TaskState.LEASED:
+                raise LifecycleConflictError("task is not leased")
+            requested = task.model_copy(update={"state": TaskState.CANCELLING})
+            self._tasks[task_id] = requested
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.TASK_CANCELLED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    task_id=task_id,
+                    payload={"requested": True},
+                )
+            )
+            return requested
+
+    async def heartbeat(
+        self,
+        tenant_id: UUID,
+        ara_id: UUID,
+        task_id: UUID | None = None,
+        lease_id: UUID | None = None,
+    ) -> Task | None:
+        async with self._lock:
+            ara = self._remote_agents.get(ara_id)
+            if ara is None or ara.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("ARA not found")
+            now = datetime.now(UTC)
+            self._remote_agents[ara_id] = ara.model_copy(update={"last_seen_at": now})
+            task = None
+            if task_id is not None or lease_id is not None:
+                if task_id is None or lease_id is None:
+                    raise LifecycleConflictError("task and lease are required together")
+                task, lease = self._active_lease(tenant_id, ara_id, task_id, lease_id)
+                if task.state not in {TaskState.LEASED, TaskState.CANCELLING}:
+                    raise LifecycleConflictError("task is not active")
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.ARA_HEARTBEAT,
+                    actor_type=ActorType.ARA,
+                    actor_id=ara_id,
+                    task_id=task.id if task else None,
+                    payload={"lease_id": str(lease_id) if lease_id else None},
+                )
+            )
+            return task
+
+    async def list_remote_agents(self, tenant_id: UUID) -> tuple[RemoteAgent, ...]:
+        async with self._lock:
+            now = datetime.now(UTC)
+            return tuple(
+                agent.model_copy(update={"status": RemoteAgentStatus.OFFLINE})
+                if agent.status is RemoteAgentStatus.ACTIVE
+                and now - agent.last_seen_at > timedelta(minutes=2)
+                else agent
+                for agent in self._remote_agents.values()
+                if agent.tenant_id == tenant_id
+            )
+
+    async def get_artifact(self, tenant_id: UUID, artifact_id: UUID) -> Artifact | None:
+        async with self._lock:
+            artifact = self._artifacts.get(artifact_id)
+            return artifact if artifact is not None and artifact.tenant_id == tenant_id else None
+
+    async def list_artifacts(self, tenant_id: UUID) -> tuple[Artifact, ...]:
+        async with self._lock:
+            return tuple(
+                item
+                for item in self._artifacts.values()
+                if item.tenant_id == tenant_id and item.deleted_at is None
+            )
+
+    async def delete_artifact(
+        self, tenant_id: UUID, artifact_id: UUID, actor_id: UUID, retention_until: datetime
+    ) -> Artifact:
+        async with self._lock:
+            artifact = self._artifacts.get(artifact_id)
+            if artifact is not None and artifact.tenant_id != tenant_id:
+                artifact = None
+            if artifact is None or artifact.deleted_at is not None:
+                raise LifecycleNotFoundError("artifact not found")
+            deleted = artifact.model_copy(
+                update={"deleted_at": datetime.now(UTC), "retention_until": retention_until}
+            )
+            self._artifacts[artifact_id] = deleted
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.ARTIFACT_DELETED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    task_id=artifact.task_id,
+                    payload={
+                        "artifact_id": str(artifact_id),
+                        "retention_until": retention_until.isoformat(),
+                    },
+                )
+            )
+            return deleted
+
     async def lease_task(
         self, tenant_id: UUID, ara_id: UUID, expires_at: datetime
     ) -> tuple[Task, Lease] | None:
@@ -584,6 +1200,14 @@ class InMemoryRuntimeStore:
             for task in sorted(self._tasks.values(), key=lambda item: item.created_at):
                 available = task.state is TaskState.PENDING or task.id in expired_task_ids
                 if task.tenant_id != tenant_id or not available:
+                    continue
+                if task.target_ara_id is not None and task.target_ara_id != ara_id:
+                    continue
+                if task.target_ara_id is not None and (
+                    remote_agent.status is not RemoteAgentStatus.ACTIVE
+                    or remote_agent.trust_level <= 0
+                    or now - remote_agent.last_seen_at > timedelta(minutes=2)
+                ):
                     continue
                 if not all(
                     capability in remote_agent.capabilities
@@ -624,7 +1248,7 @@ class InMemoryRuntimeStore:
             raise LifecycleNotFoundError("task or lease not found")
         if lease.tenant_id != tenant_id or lease.ara_id != ara_id or lease.task_id != task_id:
             raise LifecycleNotFoundError("task or lease not found")
-        if task.state is not TaskState.LEASED:
+        if task.state not in {TaskState.LEASED, TaskState.CANCELLING}:
             raise LifecycleConflictError("task is not leased")
         if lease.expires_at <= datetime.now(UTC):
             raise LifecycleConflictError("lease has expired")
@@ -709,7 +1333,12 @@ class InMemoryRuntimeStore:
                 if artifact.tenant_id != tenant_id or artifact.task_id != task_id:
                     raise LifecycleConflictError("artifact ownership mismatch")
             finished = task.model_copy(
-                update={"state": state, "result": detail, "completed_at": datetime.now(UTC)}
+                update={
+                    "state": state,
+                    "result": detail,
+                    "completed_at": datetime.now(UTC),
+                    "completed_by_ara_id": ara_id,
+                }
             )
             self._tasks[task_id] = finished
             invocation = next(
@@ -729,9 +1358,26 @@ class InMemoryRuntimeStore:
                     }
                 )
                 turn = self._turns[invocation.turn_id]
-                self._turns[turn.id] = turn.model_copy(
-                    update={"state": ConversationTurnState.PENDING, "updated_at": datetime.now(UTC)}
-                )
+                siblings = [
+                    item
+                    for item in self._tool_invocations.values()
+                    if item.turn_id == turn.id and item.target.value == "ara"
+                ]
+                if siblings and all(
+                    item.state
+                    in {
+                        ToolInvocationState.COMPLETED,
+                        ToolInvocationState.FAILED,
+                        ToolInvocationState.DENIED,
+                    }
+                    for item in siblings
+                ):
+                    self._turns[turn.id] = turn.model_copy(
+                        update={
+                            "state": ConversationTurnState.PENDING,
+                            "updated_at": datetime.now(UTC),
+                        }
+                    )
             event_type = {
                 TaskState.COMPLETED: EventType.TASK_COMPLETED,
                 TaskState.FAILED: EventType.TASK_FAILED,

@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from astra_domain import (
@@ -9,6 +10,9 @@ from astra_domain import (
     ConversationTurn,
     Lease,
     MemoryRecord,
+    MigrationBatch,
+    PersonaCore,
+    PersonaProfile,
     RemoteAgent,
     Task,
     TaskState,
@@ -63,6 +67,10 @@ class CancelTaskRequest(LeaseBoundRequest):
     reason: str = Field(min_length=1, max_length=2_000)
 
 
+class FailTaskRequest(LeaseBoundRequest):
+    error: str = Field(min_length=1, max_length=4_000)
+
+
 class ApprovalRequest(LeaseBoundRequest):
     capability: Capability
     reason: str = Field(min_length=1, max_length=2_000)
@@ -83,6 +91,41 @@ class ArtifactUploadResponse(Message):
     object_key: str
     upload_url: str
     expires_in_seconds: int
+
+
+class ArtifactDownloadResponse(Message):
+    id: UUID
+    task_id: UUID
+    name: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    created_at: datetime
+    download_url: str
+    expires_in_seconds: int
+
+
+class ArtifactMetadataResponse(Message):
+    id: UUID
+    task_id: UUID
+    name: str
+    media_type: str
+    size_bytes: int
+    sha256: str
+    created_at: datetime
+    retention_until: datetime | None
+
+
+class HeartbeatRequest(Message):
+    tenant_id: UUID
+    ara_id: UUID
+    task_id: UUID | None = None
+    lease_id: UUID | None = None
+
+
+class HeartbeatResponse(Message):
+    task_state: TaskState | None = None
+    cancellation_requested: bool = False
 
 
 class TaskLifecycleResponse(Message):
@@ -139,6 +182,29 @@ class MemoryReviewRequest(Message):
     tenant_id: UUID
     promote: bool
     replaces_memory_id: UUID | None = None
+
+
+class PersonaUpdateRequest(Message):
+    tenant_id: UUID
+    authored_core: PersonaCore
+
+
+class PersonaRevertRequest(Message):
+    tenant_id: UUID
+    version: int = Field(ge=1)
+
+
+class PersonaResponse(Message):
+    persona: PersonaProfile
+
+
+class MigrationPersonaRequest(Message):
+    tenant_id: UUID
+    authored_core: PersonaCore
+
+
+class MigrationBatchResponse(Message):
+    batch: MigrationBatch
 
 
 def remote_agent_from_registration(request: RegisterARARequest) -> RemoteAgent:

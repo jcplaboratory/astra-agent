@@ -1,9 +1,10 @@
 from uuid import UUID, uuid4
 
 from astra_agent import create_app
-from astra_agent.artifacts import UploadTarget
+from astra_agent.artifacts import DownloadTarget, UploadTarget
 from astra_agent.settings import Settings
 from astra_domain import Artifact
+from astra_runtime import InMemoryRuntimeStore
 from fastapi.testclient import TestClient
 
 
@@ -21,6 +22,12 @@ class FakeArtifactStore:
     def verify(self, artifact: Artifact) -> None:
         if not self.valid:
             raise ValueError("artifact size does not match object storage")
+
+    def prepare_download(self, artifact: Artifact) -> DownloadTarget:
+        return DownloadTarget(f"https://download.test/{artifact.object_key}", 300)
+
+    def delete(self, artifact: Artifact) -> None:
+        return None
 
 
 def _headers(tenant_id: UUID, ara_id: UUID) -> dict[str, str]:
@@ -271,3 +278,59 @@ def test_artifact_is_verified_before_completion() -> None:
             json={**bound, "result": "done", "artifacts": [artifact]},
         )
         assert completion.status_code == 200
+
+
+def test_artifact_download_is_tenant_authorized_and_deleted_with_audit() -> None:
+    tenant_id = uuid4()
+    user_id = uuid4()
+    artifact = Artifact(
+        tenant_id=tenant_id,
+        task_id=uuid4(),
+        name="report.txt",
+        media_type="text/plain",
+        object_key="tenants/untrusted/key",
+        size_bytes=10,
+        sha256="a" * 64,
+    )
+    store = InMemoryRuntimeStore()
+    store._artifacts[artifact.id] = (
+        artifact  # Seed a completed, MariaDB-equivalent artifact record.
+    )
+    with TestClient(create_app(store=store, artifact_store=FakeArtifactStore())) as client:
+        headers = {"X-Astra-Tenant-ID": str(tenant_id), "X-Astra-User-ID": str(user_id)}
+        metadata = client.get(f"/api/v1/artifacts/{artifact.id}", headers=headers)
+        assert metadata.status_code == 200
+        assert "object_key" not in metadata.json()
+        download = client.post(f"/api/v1/artifacts/{artifact.id}/download", headers=headers)
+        assert download.status_code == 200
+        assert download.json()["download_url"].endswith("tenants/untrusted/key")
+        attacker = client.post(
+            f"/api/v1/artifacts/{artifact.id}/download",
+            headers={"X-Astra-Tenant-ID": str(uuid4()), "X-Astra-User-ID": str(uuid4())},
+        )
+        assert attacker.status_code == 404
+        deleted = client.delete(f"/api/v1/artifacts/{artifact.id}", headers=headers)
+        assert deleted.status_code == 200
+        assert client.get(f"/api/v1/artifacts/{artifact.id}", headers=headers).status_code == 404
+        assert any(event.event_type.value == "artifact.deleted" for event in store._events)
+
+
+def test_heartbeat_reports_requested_task_cancellation() -> None:
+    with TestClient(create_app()) as client:
+        tenant_id, ara_id, task_id, lease_id, headers = _leased_task(client)
+        user_headers = {"X-Astra-Tenant-ID": str(tenant_id), "X-Astra-User-ID": str(uuid4())}
+        cancellation = client.post(f"/api/v1/tasks/{task_id}/cancel", headers=user_headers)
+        assert cancellation.status_code == 200
+        assert cancellation.json()["state"] == "cancelling"
+        heartbeat = client.post(
+            "/api/v1/aras/heartbeat",
+            headers=headers,
+            json={
+                "tenant_id": str(tenant_id),
+                "ara_id": str(ara_id),
+                "task_id": str(task_id),
+                "lease_id": str(lease_id),
+            },
+        )
+        assert heartbeat.status_code == 200
+        assert heartbeat.json()["cancellation_requested"] is True

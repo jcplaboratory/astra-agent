@@ -61,6 +61,11 @@ the normal schema-management path. Run the MariaDB integration test explicitly w
 ASTRA_TEST_DATABASE_URL="$ASTRA_DATABASE_URL" uv run pytest tests/test_mariadb.py -q
 ```
 
+Upgrade one migration at a time in production and verify a backup/restore before deployment. The
+current milestone adds persona profiles, durable background jobs, and artifact/ARA lifecycle
+tables through revisions `0010` to `0013`; use `uv run alembic current` to confirm the deployed
+revision. Do not use schema-on-startup as a migration substitute.
+
 ## Development
 
 ```bash
@@ -106,6 +111,12 @@ uv run ara
 The ARA executes no commands and uses no network tools. It reads bounded text files beneath the
 configured root and reports path and line evidence through the lease protocol.
 
+The main model produces a strict typed delegation plan before task persistence. Policy permits only
+the read-only repository capability and evidence deliverable, then atomically assigns up to
+`ASTRA_DELEGATION_MAX_SIBLINGS` (default `2`) distinct healthy, trusted ARAs. Targeted leases are
+claimable only by their selected ARA; manually created tasks remain normally leaseable. Final
+answers include each sibling's task and ARA provenance, including transparent partial failures.
+
 ## Tenant Workspaces And Sandbox
 
 Local model tools are disabled unless the tenant has a trusted workspace mapping. Configure each
@@ -122,12 +133,37 @@ resource limits, and an approval gate unless policy pre-authorizes the capabilit
 
 ## Memory
 
+### Hermes Holographic import
+
+Hermes imports are local, explicit, and read-only. The hosted API never accepts a filesystem path.
+Dry-run an explicit SQLite database and/or profile files locally:
+
+```bash
+uv run astra-import-hermes --tenant <tenant-uuid> \
+  --database /path/to/memory_store.db --user /path/to/USER.md \
+  --memory /path/to/MEMORY.md --soul /path/to/SOUL.md --dry-run
+```
+
+The SQLite importer accepts only its documented layout, uses `mode=ro&immutable=1`, and excludes HRR
+vectors and FTS data. The Wave 2 Markdown importer deterministically reads headings and bullets as
+inert data; it never interprets credentials, endpoints, tools, allowlists, or instructions. Every
+`USER.md`/`MEMORY.md` record is a review candidate and cannot modify the persona.
+
+Staging is never implied by a dry run. Configure `ASTRA_DATABASE_URL` and explicitly replace
+`--dry-run` with `--stage` to write a tenant-scoped staged batch. The command never activates a
+batch. Review and activation remain separate authenticated operations; rollback soft-deletes the
+batch records and queues vector deletion.
+
 Local retrieval ranks authorized MariaDB records without extra infrastructure. Set
 `ASTRA_MEMORY_BACKEND=qdrant` to use the `astra_memories` Qdrant collection. Qdrant is never the
 authorization source of truth.
 
 Set `ASTRA_MEMORY_EXTRACTOR_BACKEND=local_model` to use an OpenAI-compatible local model for strict
 JSON extraction. Malformed output or model unavailability falls back to deterministic extraction.
+
+Set `ASTRA_CONTEXT_COMPRESSOR_BACKEND=local_model` to optionally rerank/compress compiled context
+with that same local model. The deterministic compiler remains the fallback on failure or empty
+output, and `ASTRA_PERSONA_MAX_TOKENS` remains a hard context budget in both paths.
 
 ```bash
 export ASTRA_MEMORY_EXTRACTOR_BACKEND=local_model
@@ -137,6 +173,28 @@ docker compose -f compose.yaml -f compose.secure.yaml up -d --force-recreate ast
 ```
 
 For an Astra Agent process running on the host, set `ASTRA_LOCAL_MODEL_URL=http://127.0.0.1:11434/v1`.
+
+## Operations
+
+Conversation requests persist raw input and enqueue memory/vector work; they do not wait for the
+local model or Qdrant. The in-process runner claims MariaDB jobs transactionally and retries
+failures with bounded exponential backoff. Inspect failures through `GET /api/v1/tenants/{tenant_id}/jobs`
+or the TUI; restart Astra Agent to resume durable queued work after resolving the dependency.
+
+ARAs heartbeat while executing, renew leases, observe cancellation from heartbeat responses, and
+report structured task failures. An ARA is marked offline after its heartbeat expires; inspect
+health with `GET /api/v1/tenants/{tenant_id}/aras`. Keep the ARA process running separately from
+the control plane and rotate its mTLS certificate before expiry.
+
+Artifact listings contain metadata only. Request `POST /api/v1/artifacts/{artifact_id}/download`
+after selecting an authorized artifact to generate a short-lived GET URL. The server authorizes
+the artifact through MariaDB before signing; object keys are never caller input. Deletion retains
+an append-only audit event and applies the configured retention window.
+
+Sandboxed local commands require both a tenant workspace grant and `ASTRA_SANDBOX_EXECUTABLE` plus
+`ASTRA_SANDBOX_IMAGE`. The sandbox mounts the workspace read-only with no network and resource
+limits; do not grant `command.execute:workspace` unless the tenant policy and approval flow permit
+the specific command.
 
 ## Secure Local Stack
 
@@ -152,6 +210,18 @@ export ASTRA_ARA_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 sh deploy/generate-astra-dev-certs.sh "$ASTRA_TENANT_ID" "$ASTRA_ARA_ID"
 docker compose -f compose.yaml -f compose.secure.yaml up -d --build
 ```
+
+### Connect to running secure stack
+
+The simplest development connection uses the bundled local login:
+
+```bash
+ASTRA_TUI_DEV_LOGIN=true ASTRA_AGENT_URL=http://127.0.0.1:8000 uv run astra-tui
+```
+
+Alternatively, export the bearer token shown below as `ASTRA_ACCESS_TOKEN` before running the TUI.
+The token carries the tenant claim. `ASTRA_TENANT_ID` is only needed when using unauthenticated
+development headers, not with bearer-token authentication.
 
 Verify the services and obtain a development token:
 

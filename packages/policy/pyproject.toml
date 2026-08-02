@@ -2,10 +2,11 @@
 name = "astra-policy"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["astra-domain"]
+dependencies = ["astra-domain", "astra-model-providers"]
 
 [tool.uv.sources]
 astra-domain = { workspace = true }
+astra-model-providers = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

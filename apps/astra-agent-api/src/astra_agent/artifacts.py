@@ -17,6 +17,12 @@ class UploadTarget:
     expires_in_seconds: int
 
 
+@dataclass(frozen=True)
+class DownloadTarget:
+    download_url: str
+    expires_in_seconds: int
+
+
 class ArtifactStore(Protocol):
     def prepare_upload(
         self,
@@ -28,6 +34,10 @@ class ArtifactStore(Protocol):
     ) -> UploadTarget: ...
 
     def verify(self, artifact: Artifact) -> None: ...
+
+    def prepare_download(self, artifact: Artifact) -> DownloadTarget: ...
+
+    def delete(self, artifact: Artifact) -> None: ...
 
 
 class S3ArtifactStore:
@@ -80,3 +90,17 @@ class S3ArtifactStore:
             raise ValueError("artifact media type does not match object storage")
         if metadata.get("Metadata", {}).get("sha256") != artifact.sha256:
             raise ValueError("artifact SHA-256 does not match object metadata")
+
+    def prepare_download(self, artifact: Artifact) -> DownloadTarget:
+        expires = 300
+        return DownloadTarget(
+            self._client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._bucket, "Key": artifact.object_key},
+                ExpiresIn=expires,
+            ),
+            expires,
+        )
+
+    def delete(self, artifact: Artifact) -> None:
+        self._client.delete_object(Bucket=self._bucket, Key=artifact.object_key)

@@ -9,6 +9,8 @@ from astra_domain import (
     Approval,
     ApprovalState,
     AuditEvent,
+    BackgroundJob,
+    BackgroundJobKind,
     Capability,
     CapabilityKind,
     ConversationMessage,
@@ -22,15 +24,17 @@ from astra_domain import (
     ToolInvocationState,
     ToolInvocationTarget,
 )
-from astra_memory import ContextCompiler, MemoryPipeline
+from astra_memory import ContextCompiler
 from astra_model_providers import (
     MainModelProvider,
     ModelCompletion,
     ModelMessage,
     ModelProviderError,
+    PlannerDecision,
     ToolCall,
     ToolDefinition,
 )
+from astra_policy import validate_planner_decision
 from astra_runtime import LifecycleConflictError, RuntimeStore
 
 from astra_agent.settings import Settings
@@ -64,22 +68,22 @@ class ConversationOrchestrator:
         compiler: ContextCompiler,
         model_provider: MainModelProvider,
         history_limit: int,
-        memory_pipeline: MemoryPipeline | None = None,
         delegation_wait_seconds: float = 30,
         delegation_poll_seconds: float = 0.25,
         delegation_enabled: bool = True,
         tool_registry: LocalToolRegistry | None = None,
         max_tool_iterations: int = _MAX_TOOL_ITERATIONS,
+        max_delegation_siblings: int = 2,
     ) -> None:
         self._store = store
         self._compiler = compiler
         self._model_provider = model_provider
         self._history_limit = history_limit
-        self._memory_pipeline = memory_pipeline
         self._delegation_enabled = delegation_enabled
         # Kept for callers still constructing this class with the former signature.
         self._tool_registry = tool_registry or LocalToolRegistry(Settings())
         self._max_tool_iterations = max_tool_iterations
+        self._max_delegation_siblings = max_delegation_siblings
 
     async def start_turn(
         self,
@@ -120,6 +124,12 @@ class ConversationOrchestrator:
                     payload={"turn_id": str(turn.id)},
                 ),
             ),
+            BackgroundJob(
+                tenant_id=tenant_id,
+                kind=BackgroundJobKind.MEMORY_EXTRACTION,
+                source_id=user_message.id,
+                payload={"source_event_id": str(received_event.id), "content": content},
+            ),
         )
         if created.id != turn.id:
             messages = await self._store.list_messages(
@@ -129,14 +139,6 @@ class ConversationOrchestrator:
             if existing is None:
                 raise LifecycleConflictError("turn user message is unavailable")
             return existing, created
-        if self._memory_pipeline is not None:
-            try:
-                await self._memory_pipeline.process_message(
-                    tenant_id, received_event.id, user_message.id, content
-                )
-            except Exception:
-                # Conversation durability must not depend on optional memory processing.
-                pass
         return user_message, created
 
     async def advance_one(self, tenant_id: UUID) -> ConversationTurn | None:
@@ -150,6 +152,67 @@ class ConversationOrchestrator:
 
     async def run_turn(self, turn: ConversationTurn, run_lease_id: UUID) -> ConversationTurn:
         messages, iterations, pending_calls = await self._messages_for_turn(turn)
+        if "planned_task_ids" in turn.checkpoint:
+            messages.append(await self._sibling_provenance(turn))
+        elif self._delegation_enabled:
+            planner = getattr(self._model_provider, "plan", None)
+            decision = (
+                await planner(tuple(messages), self._max_delegation_siblings)
+                if callable(planner)
+                else PlannerDecision()
+            )
+            policy = validate_planner_decision(decision, self._max_delegation_siblings)
+            if not policy.allowed:
+                await self._store.append_event(
+                    AuditEvent(
+                        tenant_id=turn.tenant_id,
+                        event_type=EventType.PLANNER_DENIED,
+                        actor_type=ActorType.COORDINATOR,
+                        payload={"turn_id": str(turn.id), "reason": policy.reason},
+                    )
+                )
+            elif decision.tasks:
+                tasks = tuple(
+                    Task(
+                        tenant_id=turn.tenant_id,
+                        objective=item.objective,
+                        context=item.context,
+                        required_capabilities=tuple(
+                            Capability.model_validate(capability)
+                            for capability in item.required_capabilities
+                        ),
+                        deliverable_contract=item.deliverable_contract,
+                    )
+                    for item in decision.tasks
+                )
+                invocations = tuple(
+                    ToolInvocation(
+                        tenant_id=turn.tenant_id,
+                        turn_id=turn.id,
+                        task_id=task.id,
+                        tool_call_id=f"planner-{index}",
+                        tool_name=_ARA_DELEGATE_TOOL.name,
+                        target=ToolInvocationTarget.ARA,
+                        arguments={"objective": task.objective, "context": task.context},
+                        arguments_sha256=self._arguments_sha256(
+                            {"objective": task.objective, "context": task.context}
+                        ),
+                    )
+                    for index, task in enumerate(tasks)
+                )
+                checkpoint = {
+                    "messages": [message.model_dump() for message in messages],
+                    "iterations": iterations,
+                    "pending_calls": [],
+                    "planned_task_ids": [str(task.id) for task in tasks],
+                }
+                return (
+                    await self._store.create_delegated_tasks(
+                        turn.tenant_id, turn.id, run_lease_id, tasks, invocations, checkpoint
+                    )
+                    and (await self._store.get_turn(turn.tenant_id, turn.id))
+                    or turn
+                )
         definitions = self._tool_registry.definitions(turn.tenant_id)
         if self._delegation_enabled:
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
@@ -421,6 +484,35 @@ class ConversationOrchestrator:
                 "iterations": iterations,
                 "pending_calls": [call.model_dump() for call in pending_calls],
             },
+        )
+
+    async def _sibling_provenance(self, turn: ConversationTurn) -> ModelMessage:
+        raw_ids = turn.checkpoint.get("planned_task_ids", [])
+        if not isinstance(raw_ids, list):
+            raise LifecycleConflictError("turn checkpoint has invalid planned task ids")
+        results: list[dict[str, str | None]] = []
+        for raw_id in raw_ids:
+            task = await self._store.get_task(turn.tenant_id, UUID(str(raw_id)))
+            if task is None:
+                raise LifecycleConflictError("planned task is unavailable")
+            results.append(
+                {
+                    "task_id": str(task.id),
+                    "objective": task.objective,
+                    "state": task.state.value,
+                    "result": task.result,
+                    "target_ara_id": str(task.target_ara_id) if task.target_ara_id else None,
+                    "completed_by_ara_id": str(task.completed_by_ara_id)
+                    if task.completed_by_ara_id
+                    else None,
+                }
+            )
+        failures = sum(item["state"] != TaskState.COMPLETED.value for item in results)
+        return ModelMessage(
+            role="system",
+            content="ARA sibling provenance (synthesize transparently; "
+            "partial failures must be explicit):\n"
+            + json.dumps({"partial_failure": failures > 0, "results": results}, sort_keys=True),
         )
 
     @staticmethod

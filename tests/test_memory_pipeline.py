@@ -1,3 +1,4 @@
+import time
 from uuid import UUID, uuid4
 
 import httpx
@@ -42,6 +43,15 @@ def _headers(tenant_id: UUID) -> dict[str, str]:
     return {"X-Astra-Tenant-ID": str(tenant_id), "X-Astra-User-ID": str(uuid4())}
 
 
+def _wait_for_jobs(client: TestClient, tenant_id: UUID, headers: dict[str, str]) -> None:
+    for _ in range(50):
+        jobs = client.get(f"/api/v1/tenants/{tenant_id}/jobs", headers=headers).json()
+        if jobs and all(item["state"] in {"completed", "failed"} for item in jobs):
+            return
+        time.sleep(0.02)
+    raise AssertionError("background jobs did not finish")
+
+
 def test_memory_is_extracted_recalled_deduplicated_and_deleted() -> None:
     tenant_id = uuid4()
     headers = _headers(tenant_id)
@@ -65,6 +75,7 @@ def test_memory_is_extracted_recalled_deduplicated_and_deleted() -> None:
             ).status_code
             == 200
         )
+        _wait_for_jobs(client, tenant_id, headers)
         assert (
             client.post(
                 path,
@@ -126,6 +137,7 @@ def test_candidate_memory_is_inspectable_but_not_recalled() -> None:
                 "client_request_id": str(uuid4()),
             },
         )
+        _wait_for_jobs(client, tenant_id, headers)
         client.post(
             path,
             headers=headers,
@@ -161,6 +173,7 @@ def test_candidate_can_be_promoted_or_rejected() -> None:
                 "client_request_id": str(uuid4()),
             },
         )
+        _wait_for_jobs(client, tenant_id, headers)
         client.post(
             path,
             headers=headers,
@@ -170,6 +183,7 @@ def test_candidate_can_be_promoted_or_rejected() -> None:
                 "client_request_id": str(uuid4()),
             },
         )
+        _wait_for_jobs(client, tenant_id, headers)
         memories = client.get(f"/api/v1/tenants/{tenant_id}/memories", headers=headers).json()[
             "memories"
         ]
@@ -215,6 +229,7 @@ def test_candidate_can_replace_promoted_memory() -> None:
                 "client_request_id": str(uuid4()),
             },
         )
+        _wait_for_jobs(client, tenant_id, headers)
         client.post(
             path,
             headers=headers,
@@ -224,6 +239,7 @@ def test_candidate_can_replace_promoted_memory() -> None:
                 "client_request_id": str(uuid4()),
             },
         )
+        _wait_for_jobs(client, tenant_id, headers)
         memories = client.get(f"/api/v1/tenants/{tenant_id}/memories", headers=headers).json()[
             "memories"
         ]

@@ -264,10 +264,14 @@ version = "0.1.0"
 source = { editable = "packages/policy" }
 dependencies = [
     { name = "astra-domain" },
+    { name = "astra-model-providers" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "astra-domain", editable = "packages/domain" }]
+requires-dist = [
+    { name = "astra-domain", editable = "packages/domain" },
+    { name = "astra-model-providers", editable = "packages/model-providers" },
+]
 
 [[package]]
 name = "astra-protocol"

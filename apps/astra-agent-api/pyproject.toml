@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 astra-agent = "astra_agent.main:run"
+astra-import-hermes = "astra_agent.hermes_cli:main"
 
 [tool.uv.sources]
 astra-domain = { workspace = true }

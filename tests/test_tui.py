@@ -23,6 +23,10 @@ async def test_tui_mounts_task_and_approval_views(monkeypatch: object) -> None:
         assert app.query_one("#grant-inline", Button).disabled
         assert app.query_one("#deny-inline", Button).disabled
         assert app.query_one("#memory-list", Static)
+        assert app.query_one("#persona-list", Static)
+        assert app.query_one("#ara-list", Static)
+        assert app.query_one("#artifact-list", Static)
+        assert app.query_one("#download-artifact", Button).disabled
         message_input = app.query_one("#message-input", Input)
         assert message_input.disabled
         assert "Authentication required" in message_input.placeholder
@@ -48,7 +52,12 @@ async def test_tui_development_login_enables_message_input(monkeypatch: object) 
                 json={"status": "ok", "version": "0.1.0", "persistence": "memory"},
                 request=httpx.Request(method, "http://astra.test/health"),
             )
-        payload: object = {"memories": []} if str(url).endswith("/memories") else []
+        if str(url).endswith("/memories"):
+            payload: object = {"memories": []}
+        elif str(url).endswith("/persona"):
+            payload = {"persona": {"version": 1}}
+        else:
+            payload = []
         return httpx.Response(
             200,
             json=payload,

@@ -68,7 +68,7 @@ Before any import, the command must:
 | Creation/update time | source timestamps | Preserve as source metadata rather than overwriting Astra audit time. |
 | HRR vectors and FTS indexes | not imported | Recreate retrieval indexes from canonical imported records. |
 | `SOUL.md` / system persona | draft `PersonaProfile.authored_core` | Convert to a versioned draft; require explicit review before activation. |
-| `USER.md` | preference records | Import as promoted low-risk preferences or review candidates. |
+| `USER.md` | preference, fact, and project candidates | Deterministically import Markdown bullets for review; never auto-promote. |
 | `MEMORY.md` | facts, projects, procedures | Classify by type; separate environment notes from user facts. |
 | Skills | procedure candidates | Preserve selected skill content for review; never automatically activate tools or executable instructions. |
 | Session history | raw conversation archive | Import only with consent; extract candidate memories asynchronously after activation. |
@@ -77,7 +77,7 @@ Every imported record must include:
 
 ```text
 tenant_id
-source_system = "hermes_holographic"
+source_system = "hermes_holographic" or "hermes_profile_files"
 source_profile
 source_database_fingerprint
 source_external_id
@@ -128,14 +128,33 @@ The user must be able to promote, reject, edit, delete, or roll back every impor
 1. Import Holographic facts into staging.
 2. Convert `SOUL.md` and profile persona instructions into a draft `PersonaProfile`.
 3. Present persona and fact review to the user.
-4. On approval, atomically activate the persona version and promote the approved migration batch.
+4. On explicit batch activation, atomically promote that batch's candidate records, record their
+   review, and activate the persona version. Records from other batches are not affected.
 5. Enqueue Qdrant indexing for promoted records.
 
 ### Wave 2: Preferences And Conventions
 
 Import `USER.md` and `MEMORY.md` into structured preference, fact, project, and procedure
-records. Promote only explicit, low-risk, high-confidence content; stage all other records for
-review.
+records. **Implemented:** the local importer reads only explicit UTF-8 paths, parses headings and
+bullet items deterministically, fingerprints the combined source bytes by file role, and stages all
+records as candidates. It does not auto-promote or create/modify a persona. Security, credential,
+address, privacy, and intimate references are marked high sensitivity; executable-looking content,
+tools, endpoints, and allowlists remain inert text.
+
+Run an inventory without writes:
+
+```bash
+uv run astra-import-hermes --tenant <tenant-uuid> \
+  --user /path/to/USER.md --memory /path/to/MEMORY.md --dry-run
+```
+
+To stage, configure `ASTRA_DATABASE_URL` and use the explicit `--stage` flag. This creates only a
+staged tenant batch and never activates it:
+
+```bash
+ASTRA_DATABASE_URL='mysql+aiomysql://...' uv run astra-import-hermes \
+  --tenant <tenant-uuid> --user /path/to/USER.md --memory /path/to/MEMORY.md --stage
+```
 
 ### Wave 3: Conversation History — Opt In
 

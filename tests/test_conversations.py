@@ -2,7 +2,7 @@ from uuid import uuid4
 
 import httpx
 from astra_agent import create_app
-from astra_memory import BoundedContextCompiler
+from astra_memory import BoundedContextCompiler, LocalModelContextCompressor
 from astra_model_providers import (
     ModelCompletion,
     ModelMessage,
@@ -96,6 +96,31 @@ async def test_context_compiler_enforces_budget() -> None:
     briefing = await compiler.compile(uuid4(), "objective " * 1_000)
     assert briefing.estimated_tokens <= 100
     assert len(briefing.content) <= 400
+
+
+class ContextLocalModel:
+    def __init__(self, response: str | Exception) -> None:
+        self.response = response
+
+    async def process(self, instruction: str, content: str) -> str:
+        assert "Compress" in instruction
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+async def test_local_context_compression_is_bounded_and_falls_back() -> None:
+    fallback = BoundedContextCompiler("persona", max_tokens=10)
+    compressed = LocalModelContextCompressor(fallback, ContextLocalModel("x" * 100), 10)
+    briefing = await compressed.compile(uuid4(), "objective")
+    assert briefing.content.endswith("...")
+    assert briefing.estimated_tokens <= 10
+
+    unavailable = LocalModelContextCompressor(fallback, ContextLocalModel(RuntimeError()), 10)
+    tenant_id = uuid4()
+    assert await unavailable.compile(tenant_id, "objective") == await fallback.compile(
+        tenant_id, "objective"
+    )
 
 
 async def test_openrouter_adapter_sends_provider_neutral_messages() -> None:

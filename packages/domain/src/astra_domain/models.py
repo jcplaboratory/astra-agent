@@ -46,6 +46,7 @@ class TaskState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    CANCELLING = "cancelling"
 
 
 class ConversationTurnState(StrEnum):
@@ -106,6 +107,9 @@ class EventType(StrEnum):
     TASK_FAILED = "task.failed"
     TASK_CANCELLED = "task.cancelled"
     ARTIFACT_PRODUCED = "artifact.produced"
+    ARTIFACT_DOWNLOADED = "artifact.downloaded"
+    ARTIFACT_DELETED = "artifact.deleted"
+    ARA_HEARTBEAT = "ara.heartbeat"
     CONVERSATION_TURN_CREATED = "conversation_turn.created"
     CONVERSATION_TURN_RUNNING = "conversation_turn.running"
     CONVERSATION_TURN_PAUSED = "conversation_turn.paused"
@@ -115,6 +119,13 @@ class EventType(StrEnum):
     TOOL_INVOCATION_COMPLETED = "tool_invocation.completed"
     TOOL_INVOCATION_FAILED = "tool_invocation.failed"
     TOOL_INVOCATION_DENIED = "tool_invocation.denied"
+    PERSONA_CREATED = "persona.created"
+    PERSONA_ACTIVATED = "persona.activated"
+    PERSONA_REVERTED = "persona.reverted"
+    PLANNER_DENIED = "planner.denied"
+    MIGRATION_STAGED = "migration.staged"
+    MIGRATION_ACTIVATED = "migration.activated"
+    MIGRATION_ROLLED_BACK = "migration.rolled_back"
 
 
 class MemoryKind(StrEnum):
@@ -130,6 +141,25 @@ class MemoryState(StrEnum):
     PROMOTED = "promoted"
     REJECTED = "rejected"
     DELETED = "deleted"
+
+
+class MigrationBatchState(StrEnum):
+    STAGED = "staged"
+    ACTIVE = "active"
+    ROLLED_BACK = "rolled_back"
+
+
+class BackgroundJobKind(StrEnum):
+    MEMORY_EXTRACTION = "memory_extraction"
+    VECTOR_SYNC = "vector_sync"
+
+
+class BackgroundJobState(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    RETRY = "retry"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class MessageRole(StrEnum):
@@ -202,6 +232,7 @@ class RemoteAgent(TenantOwnedModel):
     capabilities: tuple[Capability, ...] = ()
     runtime_version: str = Field(min_length=1, max_length=100)
     status: RemoteAgentStatus = RemoteAgentStatus.ACTIVE
+    trust_level: int = Field(default=1, ge=0, le=100)
     registered_at: datetime = Field(default_factory=utc_now)
     last_seen_at: datetime = Field(default_factory=utc_now)
 
@@ -217,6 +248,8 @@ class Task(TenantOwnedModel):
     deadline: datetime | None = None
     result: str | None = Field(default=None, max_length=50_000)
     completed_at: datetime | None = None
+    target_ara_id: UUID | None = None
+    completed_by_ara_id: UUID | None = None
 
     @model_validator(mode="after")
     def validate_deadline(self) -> Task:
@@ -274,6 +307,8 @@ class Artifact(TenantOwnedModel):
     size_bytes: int = Field(ge=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     created_at: datetime = Field(default_factory=utc_now)
+    deleted_at: datetime | None = None
+    retention_until: datetime | None = None
 
 
 class AuditEvent(TenantOwnedModel):
@@ -286,12 +321,72 @@ class AuditEvent(TenantOwnedModel):
     occurred_at: datetime = Field(default_factory=utc_now)
 
 
-class Persona(TenantOwnedModel):
+class JobError(DomainModel):
+    type: str = Field(min_length=1, max_length=200)
+    message: str = Field(min_length=1, max_length=4_000)
+
+
+class BackgroundJob(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    kind: BackgroundJobKind
+    source_id: UUID
+    payload: dict[str, Any] = Field(default_factory=dict)
+    state: BackgroundJobState = BackgroundJobState.PENDING
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=8, ge=1, le=100)
+    available_at: datetime = Field(default_factory=utc_now)
+    lease_id: UUID | None = None
+    lease_expires_at: datetime | None = None
+    last_error: JobError | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_lease(self) -> BackgroundJob:
+        if (self.lease_id is None) != (self.lease_expires_at is None):
+            raise ValueError("job lease id and expiry must be provided together")
+        return self
+
+
+class JobAttempt(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    job_id: UUID
+    attempt: int = Field(ge=1)
+    started_at: datetime = Field(default_factory=utc_now)
+    finished_at: datetime | None = None
+    error: JobError | None = None
+
+
+class PersonaCore(DomainModel):
+    values: str = Field(min_length=1, max_length=4_000)
+    boundaries: str = Field(min_length=1, max_length=4_000)
+    tone: str = Field(min_length=1, max_length=2_000)
+    initiative: str = Field(min_length=1, max_length=2_000)
+    emotional_range: str = Field(min_length=1, max_length=2_000)
+    disagreement: str = Field(min_length=1, max_length=2_000)
+
+
+class PersonaProfile(TenantOwnedModel):
     id: UUID = Field(default_factory=uuid4)
     version: int = Field(ge=1)
-    authored_core: dict[str, Any]
-    learned_adaptation: dict[str, Any] = Field(default_factory=dict)
+    authored_core: PersonaCore
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class LearnedAdaptationState(StrEnum):
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
+class LearnedPersonaAdaptation(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    profile_id: UUID
+    content: str = Field(min_length=1, max_length=4_000)
+    state: LearnedAdaptationState = LearnedAdaptationState.ACTIVE
+    source: str = Field(min_length=1, max_length=200)
+    created_at: datetime = Field(default_factory=utc_now)
+    reversed_at: datetime | None = None
 
 
 class MemoryRecord(TenantOwnedModel):
@@ -313,3 +408,21 @@ class MemoryRecord(TenantOwnedModel):
     reviewed_at: datetime | None = None
     reviewed_by: UUID | None = None
     deleted_at: datetime | None = None
+    import_batch_id: UUID | None = None
+    source_system: str | None = Field(default=None, max_length=100)
+    source_database_fingerprint: str | None = Field(default=None, max_length=64)
+    source_external_id: str | None = Field(default=None, max_length=500)
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class MigrationBatch(TenantOwnedModel):
+    id: UUID = Field(default_factory=uuid4)
+    source_system: str = Field(min_length=1, max_length=100)
+    source_database_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    state: MigrationBatchState = MigrationBatchState.STAGED
+    source_metadata: dict[str, Any] = Field(default_factory=dict)
+    persona_draft: PersonaCore | None = None
+    persona_profile_id: UUID | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    activated_at: datetime | None = None
+    rolled_back_at: datetime | None = None
