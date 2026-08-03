@@ -93,7 +93,8 @@ configure_vault_pki() {
       common_name='Astra ARA Root CA' ttl=87600h >/dev/null || die "could not create Vault PKI root CA"
   fi
   env "${vault_env[@]}" vault write "$pki_mount/roles/$ingress_role" \
-    allowed_domains="$ingress_name" allow_subdomains=true server_flag=true client_flag=false max_ttl=720h >/dev/null
+    allowed_domains="$ingress_name" allow_bare_domains=true allow_subdomains=true \
+    server_flag=true client_flag=false max_ttl=720h >/dev/null
   env "${vault_env[@]}" vault write "$pki_mount/roles/$ara_role" \
     allow_any_name=true server_flag=false client_flag=true max_ttl=168h >/dev/null
   install -d -m 700 "$tls_dir"
