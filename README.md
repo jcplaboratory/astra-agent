@@ -51,13 +51,18 @@ For a local single-host installation, run:
 bash install.sh
 ```
 
-The installer interactively selects a local or Docker controller, an existing MariaDB instance or
-a new MariaDB container, and optional OpenRouter credentials/model. Qdrant always runs in Docker.
-It stores the generated Compose definition and private environment file under
-`~/.config/astra-agent` (or `ASTRA_INSTALL_DIR`), then installs `astra-tui` and the `agent-tui`
-alias in `/usr/bin`; it will request `sudo` for those launchers. For an existing database, enter a
-SQLAlchemy URL reachable from the selected controller: a Docker controller cannot use
-`127.0.0.1` to reach a database running on the host.
+This is a production installer and must be run as `root`. It collects every controller setting,
+including Keycloak base URL, realm, client audience, JWKS endpoint, tenant claim, mTLS ingress,
+OpenRouter, S3 artifacts, Qdrant, local-model processing, delegated ARAs, tenant workspaces, and
+sandbox limits. It selects a local or Docker controller, an existing MariaDB instance or a new
+private MariaDB container, and runs Qdrant in Docker. Provide a directory containing production
+`server.crt`, `server.key`, and `ca.crt` files for the ARA mTLS ingress.
+
+The installer writes a root-only environment file and Compose definition to `/etc/astra-agent`
+(override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs `astra-tui` plus
+the `agent-tui` alias in `/usr/bin`. It deliberately leaves user-facing HTTPS termination to the
+operator's gateway. For an existing database, enter a SQLAlchemy URL reachable by the selected
+controller: a Docker controller cannot use `127.0.0.1` to reach a database running on the host.
 
 ## MariaDB
 

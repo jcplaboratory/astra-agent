@@ -18,7 +18,7 @@ server {
     ssl_verify_client on;
 
     location /api/v1/aras/ {
-        proxy_pass http://astra-agent:8000;
+        proxy_pass http://${ASTRA_CONTROLLER_UPSTREAM};
         proxy_set_header X-Client-Verify $ssl_client_verify;
         proxy_set_header X-Astra-Cert-Tenant-ID $astra_tenant_id;
         proxy_set_header X-Astra-Cert-ARA-ID $astra_ara_id;
