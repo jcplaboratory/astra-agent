@@ -58,7 +58,7 @@ UV_BIN=$(command -v uv)
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
 
 if [ "$(id -u)" -ne 0 ] && [ "${ASTRA_TEST_MODE:-false}" != true ]; then
-  die "run this production installer as root so it can secure /etc and install /usr/bin/agent-tui"
+  die "run this production installer as root so it can secure /etc and install /usr/bin/astra"
 fi
 
 install -d -m 700 "$INSTALL_DIR" "$TUI_BIN_DIR"
@@ -69,7 +69,7 @@ printf '%s\n\n' 'All controller configuration is collected below. Credentials ar
 
 controller_mode=$(choose 'Run the controller' docker 'local docker')
 controller_port=$(prompt 'Private controller HTTP port' '8000')
-public_agent_url=$(prompt_required 'User-facing HTTPS API URL for agent-tui')
+public_agent_url=$(prompt_required 'User-facing HTTPS API URL for astra')
 ingress_port=$(prompt 'Public ARA mTLS ingress port' '8443')
 tls_dir=$(prompt_required 'Directory containing server.crt, server.key, and ca.crt for ARA ingress')
 [ -r "$tls_dir/server.crt" ] && [ -r "$tls_dir/server.key" ] && [ -r "$tls_dir/ca.crt" ] || die "TLS directory must contain readable server.crt, server.key, and ca.crt"
@@ -284,18 +284,17 @@ chmod 600 "$COMPOSE_FILE"
 
 if [ "${ASTRA_SKIP_TUI_INSTALL:-false}" != true ]; then
   UV_TOOL_BIN_DIR="$TUI_BIN_DIR" uv tool install --editable --force "$ROOT_DIR/apps/astra-tui"
-  cat > /usr/bin/astra-tui <<EOF
+  cat > /usr/bin/astra <<EOF
 #!/usr/bin/env sh
 ASTRA_AGENT_URL=$(env_value "$public_agent_url")
 export ASTRA_AGENT_URL
 exec $(env_value "$TUI_BIN_DIR/astra-tui") "\$@"
 EOF
-  chmod 755 /usr/bin/astra-tui
-  ln -sfn /usr/bin/astra-tui /usr/bin/agent-tui
+  chmod 755 /usr/bin/astra
 fi
 
-tui_install_note='agent-tui is installed at /usr/bin/agent-tui'
-if [ "${ASTRA_SKIP_TUI_INSTALL:-false}" = true ]; then tui_install_note='agent-tui installation was skipped'; fi
+tui_install_note='astra is installed at /usr/bin/astra'
+if [ "${ASTRA_SKIP_TUI_INSTALL:-false}" = true ]; then tui_install_note='astra installation was skipped'; fi
 
 if [ "${ASTRA_SKIP_START:-false}" != true ]; then
   docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --build

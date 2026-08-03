@@ -59,8 +59,8 @@ private MariaDB container, and runs Qdrant in Docker. Provide a directory contai
 `server.crt`, `server.key`, and `ca.crt` files for the ARA mTLS ingress.
 
 The installer writes a root-only environment file and Compose definition to `/etc/astra-agent`
-(override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs `astra-tui` plus
-the `agent-tui` alias in `/usr/bin`. It deliberately leaves user-facing HTTPS termination to the
+(override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs the `astra`
+launcher in `/usr/bin`. It deliberately leaves user-facing HTTPS termination to the
 operator's gateway. For an existing database, enter a SQLAlchemy URL reachable by the selected
 controller: a Docker controller cannot use `127.0.0.1` to reach a database running on the host.
 
