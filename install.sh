@@ -52,8 +52,86 @@ env_value() {
 
 write_env() { printf '%s=%s\n' "$1" "$(env_value "$2")" >> "$ENV_FILE"; }
 
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f1
+  else shasum -a 256 "$1" | cut -d ' ' -f1
+  fi
+}
+
+install_vault_cli() {
+  local version=$1 os arch archive checksum expected='' actual download_dir
+  require_command curl
+  require_command unzip
+  case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) die "unsupported Vault CLI platform" ;; esac
+  case "$(uname -m)" in x86_64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) die "unsupported Vault CLI architecture" ;; esac
+  download_dir=$(mktemp -d)
+  archive="vault_${version}_${os}_${arch}.zip"
+  checksum="vault_${version}_SHA256SUMS"
+  curl --fail --silent --show-error --location \
+    "https://releases.hashicorp.com/vault/${version}/${archive}" -o "$download_dir/$archive"
+  curl --fail --silent --show-error --location \
+    "https://releases.hashicorp.com/vault/${version}/${checksum}" -o "$download_dir/$checksum"
+  while read -r actual _; do
+    [ "$_" = "$archive" ] && expected=$actual && break
+  done < "$download_dir/$checksum"
+  [ -n "$expected" ] || die "could not locate Vault archive checksum"
+  actual=$(sha256_file "$download_dir/$archive")
+  [ "$actual" = "$expected" ] || die "Vault archive checksum verification failed"
+  unzip -q "$download_dir/$archive" -d "$download_dir"
+  install -m 755 "$download_dir/vault" /usr/local/bin/vault
+  rm -rf "$download_dir"
+}
+
+configure_vault_pki() {
+  local vault_addr=$1 vault_token=$2 pki_mount=$3 ingress_role=$4 ara_role=$5 ingress_name=$6 tls_dir=$7
+  local vault_env=("VAULT_ADDR=$vault_addr" "VAULT_TOKEN=$vault_token") issue_response
+  env "${vault_env[@]}" vault token lookup >/dev/null || die "Vault token authentication failed"
+  if ! env "${vault_env[@]}" vault read -field=certificate "$pki_mount/cert/ca" >/dev/null 2>&1; then
+    env "${vault_env[@]}" vault secrets enable -path="$pki_mount" pki >/dev/null 2>&1 || \
+      die "could not enable or access Vault PKI mount $pki_mount"
+    env "${vault_env[@]}" vault write -field=certificate "$pki_mount/root/generate/internal" \
+      common_name='Astra ARA Root CA' ttl=87600h >/dev/null || die "could not create Vault PKI root CA"
+  fi
+  env "${vault_env[@]}" vault write "$pki_mount/roles/$ingress_role" \
+    allowed_domains="$ingress_name" allow_subdomains=true server_flag=true client_flag=false max_ttl=720h >/dev/null
+  env "${vault_env[@]}" vault write "$pki_mount/roles/$ara_role" \
+    allow_any_name=true server_flag=false client_flag=true max_ttl=168h >/dev/null
+  install -d -m 700 "$tls_dir"
+  issue_response=$(mktemp)
+  env "${vault_env[@]}" vault write -format=json "$pki_mount/issue/$ingress_role" \
+    common_name="$ingress_name" alt_names="$ingress_name" ttl=720h > "$issue_response"
+  python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["data"]["certificate"])' "$issue_response" > "$tls_dir/server.crt"
+  python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["data"]["private_key"])' "$issue_response" > "$tls_dir/server.key"
+  rm -f "$issue_response"
+  # The issuing CA is what nginx uses to verify ARA client certificates.
+  env "${vault_env[@]}" vault read -field=certificate "$pki_mount/cert/ca" > "$tls_dir/ca.crt"
+  chmod 600 "$tls_dir/server.key"
+  chmod 644 "$tls_dir/server.crt" "$tls_dir/ca.crt"
+}
+
+issue_ara_certificate() {
+  local vault_addr=$1 vault_token=$2 pki_mount=$3 ara_role=$4 tenant_id=$5 ara_id=$6 output_dir=$7
+  local vault_env=("VAULT_ADDR=$vault_addr" "VAULT_TOKEN=$vault_token") issue_response
+  install -d -m 700 "$output_dir"
+  issue_response=$(mktemp)
+  env "${vault_env[@]}" vault write -format=json "$pki_mount/issue/$ara_role" \
+    common_name="$ara_id" ou="$tenant_id" ttl=168h > "$issue_response"
+  python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["data"]["certificate"])' "$issue_response" > "$output_dir/ara.crt"
+  python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["data"]["private_key"])' "$issue_response" > "$output_dir/ara.key"
+  python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["data"]["issuing_ca"])' "$issue_response" > "$output_dir/ca.crt"
+  rm -f "$issue_response"
+  chmod 600 "$output_dir/ara.key"
+  chmod 644 "$output_dir/ara.crt" "$output_dir/ca.crt"
+}
+
 require_command docker
 require_command uv
+require_command python3
 UV_BIN=$(command -v uv)
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
 
@@ -71,8 +149,27 @@ controller_mode=$(choose 'Run the controller' docker 'local docker')
 controller_port=$(prompt 'Private controller HTTP port' '8000')
 public_agent_url=$(prompt_required 'User-facing HTTPS API URL for astra')
 ingress_port=$(prompt 'Public ARA mTLS ingress port' '8443')
-tls_dir=$(prompt_required 'Directory containing server.crt, server.key, and ca.crt for ARA ingress')
-[ -r "$tls_dir/server.crt" ] && [ -r "$tls_dir/server.key" ] && [ -r "$tls_dir/ca.crt" ] || die "TLS directory must contain readable server.crt, server.key, and ca.crt"
+ara_ingress_name=$(prompt_required 'Public DNS name for ARA mTLS ingress certificate')
+vault_addr=$(prompt_required 'HCP Vault address')
+vault_pki_mount=$(prompt 'Vault PKI engine path' 'astra-pki')
+vault_token=$(prompt_secret 'Vault token (used only during installation)')
+vault_ingress_role=$(prompt 'Vault PKI ingress role' 'astra-ingress')
+vault_ara_role=$(prompt 'Vault PKI ARA client role' 'astra-ara')
+tls_dir=$(prompt 'Ingress certificate directory' "$INSTALL_DIR/tls")
+if ! command -v vault >/dev/null 2>&1; then
+  vault_version=$(prompt 'Vault CLI version' '1.18.3')
+  install_vault_cli "$vault_version"
+fi
+configure_vault_pki "$vault_addr" "$vault_token" "$vault_pki_mount" "$vault_ingress_role" \
+  "$vault_ara_role" "$ara_ingress_name" "$tls_dir"
+if confirm 'Issue the first ARA client certificate now?'; then
+  ara_tenant_id=$(prompt_required 'ARA tenant UUID')
+  ara_id=$(prompt_required 'ARA UUID')
+  ara_certificate_dir=$(prompt 'ARA certificate output directory' "$INSTALL_DIR/ara")
+  issue_ara_certificate "$vault_addr" "$vault_token" "$vault_pki_mount" "$vault_ara_role" \
+    "$ara_tenant_id" "$ara_id" "$ara_certificate_dir"
+fi
+unset vault_token
 
 if confirm 'Use an existing MariaDB instance?'; then
   database_url=$(prompt_required 'MariaDB SQLAlchemy URL reachable by the controller')

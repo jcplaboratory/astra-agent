@@ -55,8 +55,17 @@ This is a production installer and must be run as `root`. It collects every cont
 including Keycloak base URL, realm, client audience, JWKS endpoint, tenant claim, mTLS ingress,
 OpenRouter, S3 artifacts, Qdrant, local-model processing, delegated ARAs, tenant workspaces, and
 sandbox limits. It selects a local or Docker controller, an existing MariaDB instance or a new
-private MariaDB container, and runs Qdrant in Docker. Provide a directory containing production
-`server.crt`, `server.key`, and `ca.crt` files for the ARA mTLS ingress.
+private MariaDB container, and runs Qdrant in Docker. It also prompts for the HCP Vault address,
+PKI engine path, and a Vault token. It installs a checksum-verified Vault CLI when needed, creates
+or reuses the PKI mount, configures ingress and ARA roles, and issues the ARA mTLS ingress
+certificate into `/etc/astra-agent/tls` by default. It can also issue the first ARA client
+certificate, with its certificate subject populated from the prompted tenant and ARA UUIDs. The
+Vault token is used only during setup and is not written to Astra Agent configuration.
+
+The supplied token must be authorized to inspect or enable the selected PKI mount, create the
+configured roles, generate the CA when the mount is new, and issue ingress and ARA certificates.
+For an existing centrally managed PKI mount, use the mount and role names approved by its operator;
+the installer will update those roles with Astra's required server/client constraints.
 
 The installer writes a root-only environment file and Compose definition to `/etc/astra-agent`
 (override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs the `astra`
