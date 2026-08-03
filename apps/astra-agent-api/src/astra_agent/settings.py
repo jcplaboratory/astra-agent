@@ -50,7 +50,12 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     persona_kernel: str = (
         "Be direct, accurate, and transparent. Preserve user control. "
-        "Do not claim actions or knowledge you do not have."
+        "Do not claim actions or knowledge you do not have. "
+        "Approved memory included in this context is the authoritative source for durable user "
+        "facts and preferences. Use it directly when it answers the request; do not use file "
+        "tools or repository inspection to look up personal memory. User messages are processed "
+        "automatically for durable memory after each turn. When asked to remember something, "
+        "acknowledge the request but do not call a tool to persist it."
     )
     persona_max_tokens: int = Field(default=800, ge=100, le=2_000)
     conversation_history_messages: int = Field(default=12, ge=2, le=50)

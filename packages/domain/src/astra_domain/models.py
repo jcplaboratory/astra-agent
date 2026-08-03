@@ -90,6 +90,8 @@ class EventType(StrEnum):
     MODEL_REQUEST = "model.request"
     MODEL_RESPONSE = "model.response"
     MODEL_FAILED = "model.failed"
+    PIPELINE_FAILED = "pipeline.failed"
+    PIPELINE_RECOVERED = "pipeline.recovered"
     MEMORY_CANDIDATE_CREATED = "memory.candidate_created"
     MEMORY_PROMOTED = "memory.promoted"
     MEMORY_REJECTED = "memory.rejected"

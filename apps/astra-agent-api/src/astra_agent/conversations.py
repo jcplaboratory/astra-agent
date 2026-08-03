@@ -1,6 +1,6 @@
 import hashlib
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -89,6 +89,7 @@ class ConversationOrchestrator:
         tool_registry: LocalToolRegistry | None = None,
         max_tool_iterations: int = _MAX_TOOL_ITERATIONS,
         max_delegation_siblings: int = 2,
+        audit: Callable[[UUID, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._store = store
         self._compiler = compiler
@@ -99,6 +100,11 @@ class ConversationOrchestrator:
         self._tool_registry = tool_registry or LocalToolRegistry(Settings())
         self._max_tool_iterations = max_tool_iterations
         self._max_delegation_siblings = max_delegation_siblings
+        self._audit = audit
+
+    def _record_audit(self, turn: ConversationTurn, stage: str, **payload: Any) -> None:
+        if self._audit is not None:
+            self._audit(turn.client_request_id, stage, payload)
 
     async def start_turn(
         self,
@@ -261,6 +267,12 @@ class ConversationOrchestrator:
                     payload={"turn_id": str(turn.id), "message_count": len(messages)},
                 )
             )
+            self._record_audit(
+                turn,
+                "provider.request",
+                messages=[message.model_dump() for message in messages],
+                tools=[tool.model_dump() for tool in definitions],
+            )
             try:
                 completion = await self._model_provider.complete(tuple(messages), definitions)
             except ModelProviderError:
@@ -288,6 +300,7 @@ class ConversationOrchestrator:
             )
             if not completion.tool_calls:
                 content = completion.content or "I could not produce a response."
+                self._record_audit(turn, "provider.response", content=content)
                 return await self._store.complete_turn(
                     turn.tenant_id,
                     turn.id,
@@ -345,6 +358,12 @@ class ConversationOrchestrator:
             while iterations < self._max_tool_iterations:
                 content: list[str] = []
                 calls: list[ToolCall] = []
+                self._record_audit(
+                    turn,
+                    "provider.request",
+                    messages=[message.model_dump() for message in messages],
+                    tools=[tool.model_dump() for tool in definitions],
+                )
                 async for event in streamer(tuple(messages), definitions):
                     if event.kind == "content":
                         content.append(event.content)
@@ -352,6 +371,7 @@ class ConversationOrchestrator:
                         calls.append(event.tool_call)
                     yield event
                 if not calls:
+                    self._record_audit(turn, "provider.response", content="".join(content))
                     await self._store.complete_turn(
                         turn.tenant_id,
                         turn.id,

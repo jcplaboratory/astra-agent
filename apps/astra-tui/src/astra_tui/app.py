@@ -1,4 +1,5 @@
 import json
+import sys
 from uuid import UUID, uuid4
 
 import httpx
@@ -80,8 +81,9 @@ class AstraAgentApp(App[None]):
         ("ctrl+l", "clear_conversation", "Clear"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, *, audit: bool = False) -> None:
         super().__init__()
+        self.audit = audit
         self.base_url: str = ""
         self.tenant_id: str | None = None
         self.user_id: str | None = None
@@ -264,6 +266,7 @@ class AstraAgentApp(App[None]):
                 approvals_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/approvals")
                 memories_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/memories")
                 jobs_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/jobs")
+                events_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/events")
                 persona_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/persona")
                 aras_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/aras")
                 artifacts_response = await client.get(f"/api/v1/tenants/{self.tenant_id}/artifacts")
@@ -272,6 +275,7 @@ class AstraAgentApp(App[None]):
                 approvals_response.raise_for_status()
                 memories_response.raise_for_status()
                 jobs_response.raise_for_status()
+                events_response.raise_for_status()
                 persona_response.raise_for_status()
                 aras_response.raise_for_status()
                 artifacts_response.raise_for_status()
@@ -280,6 +284,11 @@ class AstraAgentApp(App[None]):
             approvals = [item for item in approvals_response.json() if item["state"] == "pending"]
             memories = memories_response.json()["memories"]
             failures = [item for item in jobs_response.json() if item["state"] == "failed"]
+            pipeline_events = [
+                item
+                for item in events_response.json()
+                if item["event_type"] in {"pipeline.failed", "pipeline.recovered"}
+            ]
             persona = persona_response.json()["persona"]
             aras = aras_response.json()
             artifacts = artifacts_response.json()
@@ -311,10 +320,16 @@ class AstraAgentApp(App[None]):
                 "\n".join(memory_lines) or "No approved memory"
             )
             failure_lines = [
+                f"{item['event_type']}: {item['payload']['stage']}"
+                + (f" - {item['payload']['error']}" if item['payload'].get("error") else "")
+                for item in pipeline_events[-3:]
+            ] + [
                 f"{item['kind']}: {item.get('last_error', {}).get('message', 'failed')}"
                 for item in failures[:3]
             ]
-            self.query_one("#job-list", Static).update("\n".join(failure_lines) or "No failed jobs")
+            self.query_one("#job-list", Static).update(
+                "\n".join(failure_lines) or "No pipeline issues"
+            )
             self.query_one("#persona-list", Static).update(f"Version {persona['version']}")
             ara_lines = [f"{item['status']:>8}  {item['name']}" for item in aras[-5:]]
             self.query_one("#ara-list", Static).update("\n".join(ara_lines) or "No registered ARAs")
@@ -471,7 +486,7 @@ class AstraAgentApp(App[None]):
                     f"/api/v1/conversations/{self.conversation_id}/messages/stream",
                     json={
                         "tenant_id": self.tenant_id,
-                        "client_request_id": str(uuid4()),
+                        "client_request_id": str(trace_id := uuid4()),
                         "content": content,
                     },
                 ) as response:
@@ -499,6 +514,8 @@ class AstraAgentApp(App[None]):
                             live.update(Text(f"Using {tool}..."))
             if answer:
                 log.write(f"[bold #86efac]Astra[/]: {answer}")
+            if self.audit:
+                await self._render_audit(trace_id)
             live.update("")
         except (httpx.HTTPError, KeyError, ValueError) as error:
             log.write(f"[bold #fca5a5]Error[/]: {error}")
@@ -520,6 +537,24 @@ class AstraAgentApp(App[None]):
             }
         return {}
 
+    async def _render_audit(self, trace_id: UUID) -> None:
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=3, headers=self._user_headers()
+            ) as client:
+                response = await client.get(f"/api/v1/audit/{trace_id}")
+                response.raise_for_status()
+            events = response.json()["events"]
+            self.query_one("#conversation-log", RichLog).write("[bold #fbbf24]Audit[/]")
+            for event in events:
+                stage = event.pop("stage")
+                event.pop("at", None)
+                self.query_one("#conversation-log", RichLog).write(
+                    Text(f"{stage}: {json.dumps(event, indent=2, ensure_ascii=True)}")
+                )
+        except (httpx.HTTPError, KeyError, ValueError):
+            return
+
 
 def run() -> None:
-    AstraAgentApp().run()
+    AstraAgentApp(audit="--audit" in sys.argv[1:]).run()

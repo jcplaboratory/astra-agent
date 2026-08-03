@@ -284,6 +284,81 @@ async def test_vector_results_are_intersected_with_authorized_mariadb_records() 
     assert briefing.source_memory_ids == ()
 
 
+async def test_memory_ranking_audit_identifies_lexical_fallback() -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    foreign_id = uuid4()
+    compiler = MemoryContextCompiler(
+        InMemoryRuntimeStore(),
+        MaliciousVectorIndex(foreign_id),
+        "safe persona",
+        audit=lambda stage, payload: events.append((stage, payload)),
+    )
+
+    await compiler.compile(uuid4(), "secret")
+
+    assert events == [
+        (
+            "memory.ranking",
+            {
+                "objective": "secret",
+                "strategy": "lexical",
+                "qdrant_available": True,
+                "authorized_memory_ids": [],
+                "qdrant_ranked_memory_ids": [str(foreign_id)],
+                "selected_memory_ids": [],
+            },
+        )
+    ]
+
+
+async def test_lexical_ranking_recalls_nightly_plants_memory_despite_qdrant_order() -> None:
+    store = InMemoryRuntimeStore()
+    tenant_id = uuid4()
+    plants = MemoryRecord(
+        tenant_id=tenant_id,
+        kind="fact",
+        content="Water the plants every night",
+        normalized_content="water the plants every night",
+        source_event_id=uuid4(),
+        source_message_id=uuid4(),
+        confidence=1,
+        confirmed=True,
+        state=MemoryState.PROMOTED,
+    )
+    unrelated = MemoryRecord(
+        tenant_id=tenant_id,
+        kind="fact",
+        content="Prefers concise answers",
+        normalized_content="prefers concise answers",
+        source_event_id=uuid4(),
+        source_message_id=uuid4(),
+        confidence=1,
+        confirmed=True,
+        state=MemoryState.PROMOTED,
+    )
+    await store.upsert_memory(plants, ())
+    await store.upsert_memory(unrelated, ())
+    compiler = MemoryContextCompiler(
+        store, MaliciousVectorIndex(unrelated.id), "safe persona", memory_limit=1
+    )
+
+    briefing = await compiler.compile(tenant_id, "What do I like to do every night?")
+
+    assert briefing.source_memory_ids == (plants.id,)
+    assert "Water the plants every night" in briefing.content
+
+
+async def test_memory_context_instructs_model_to_use_approved_memory_directly() -> None:
+    briefing = await MemoryContextCompiler(
+        InMemoryRuntimeStore(),
+        NullVectorIndex(),
+        "Approved memory is authoritative. Do not use file tools for personal memory.",
+    ).compile(uuid4(), "What do I like to do every night?")
+
+    assert "Approved memory is authoritative" in briefing.content
+    assert "Do not use file tools" in briefing.content
+
+
 async def test_qdrant_query_contains_tenant_visibility_and_authorized_ids() -> None:
     tenant_id = uuid4()
     allowed_id = uuid4()

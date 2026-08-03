@@ -94,6 +94,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from astra_agent.artifacts import ArtifactStore, S3ArtifactStore
+from astra_agent.audit import SessionAudit
 from astra_agent.auth import (
     ARAPrincipal,
     DevelopmentUserAuthenticator,
@@ -183,6 +184,7 @@ def create_app(
                 await create_schema(engine)
             runtime_store = cast(RuntimeStore, MariaDBRuntimeStore(engine))
         app.state.store = runtime_store or InMemoryRuntimeStore()
+        app.state.session_audit = SessionAudit()
         app.state.settings = settings
         app.state.artifact_store = artifact_store
         if app.state.artifact_store is None and settings.artifact_bucket:
@@ -233,18 +235,56 @@ def create_app(
                 settings.local_model_name,
                 settings.local_model_api_key,
             )
-            extractor = ModelBackedMemoryExtractor(app.state.local_model_provider)
+            def audit_local_model(stage: str, payload: dict[str, object]) -> None:
+                content = payload.get("input", payload.get("content"))
+                if isinstance(content, str):
+                    trace_id = app.state.session_audit.for_content(content)
+                    if trace_id is not None:
+                        app.state.session_audit.record(trace_id, stage, payload)
+                if stage == "local_model.failed":
+                    tenant_id = app.state.session_audit.tenant_for_content(content or "")
+                    if tenant_id is not None:
+                        asyncio.create_task(
+                            app.state.store.append_event(
+                                AuditEvent(
+                                    tenant_id=tenant_id,
+                                    event_type=EventType.PIPELINE_RECOVERED,
+                                    actor_type=ActorType.COORDINATOR,
+                                    payload={
+                                        "stage": "local_model.extraction",
+                                        "error": payload["error"],
+                                    },
+                                )
+                            )
+                        )
+
+            extractor = ModelBackedMemoryExtractor(
+                app.state.local_model_provider, audit=audit_local_model
+            )
+        def audit_vector_sync(stage: str, payload: dict[str, object]) -> None:
+            memory = payload.get("memory")
+            if isinstance(memory, dict) and isinstance(memory.get("source_message_id"), str):
+                trace_id = app.state.session_audit.for_message(UUID(memory["source_message_id"]))
+                if trace_id is not None:
+                    app.state.session_audit.record(trace_id, stage, payload)
+
         app.state.memory_pipeline = MemoryPipeline(
-            app.state.store,
-            extractor,
-            app.state.vector_index,
+            app.state.store, extractor, app.state.vector_index, audit=audit_vector_sync
         )
+        def audit_memory_ranking(stage: str, payload: dict[str, object]) -> None:
+            objective = payload.pop("objective", None)
+            if isinstance(objective, str):
+                trace_id = app.state.session_audit.for_objective(objective)
+                if trace_id is not None:
+                    app.state.session_audit.record(trace_id, stage, payload)
+
         deterministic_compiler = MemoryContextCompiler(
             app.state.store,
             app.state.vector_index,
             settings.persona_kernel,
             settings.persona_max_tokens,
             settings.memory_max_records,
+            audit=audit_memory_ranking,
         )
         if context_compiler is not None:
             app.state.context_compiler = context_compiler
@@ -269,6 +309,7 @@ def create_app(
             settings.delegation_enabled,
             app.state.tool_registry,
             max_delegation_siblings=settings.delegation_max_siblings,
+            audit=app.state.session_audit.record,
         )
         runner_tasks: dict[UUID, asyncio.Task[None]] = {}
 
@@ -309,12 +350,25 @@ def create_app(
                     continue
                 try:
                     if job.kind is BackgroundJobKind.MEMORY_EXTRACTION:
+                        trace_id = app.state.session_audit.for_message(job.source_id)
+                        if trace_id is not None:
+                            app.state.session_audit.record(
+                                trace_id,
+                                "memory.extraction",
+                                {"content": str(job.payload["content"])},
+                            )
                         records = await app.state.memory_pipeline.extract_message(
                             job.tenant_id,
                             UUID(str(job.payload["source_event_id"])),
                             job.source_id,
                             str(job.payload["content"]),
                         )
+                        if trace_id is not None:
+                            app.state.session_audit.record(
+                                trace_id,
+                                "memory.records",
+                                {"records": [record.model_dump(mode="json") for record in records]},
+                            )
                         for record in records:
                             if record.state is MemoryState.PROMOTED:
                                 await app.state.store.enqueue_job(
@@ -333,6 +387,21 @@ def create_app(
                     raise
                 except Exception as error:
                     delay = min(300, 2 ** min(job.attempt_count, 8))
+                    await app.state.store.append_event(
+                        AuditEvent(
+                            tenant_id=job.tenant_id,
+                            event_type=EventType.PIPELINE_FAILED,
+                            actor_type=ActorType.COORDINATOR,
+                            payload={
+                                "stage": job.kind.value,
+                                "job_id": str(job.id),
+                                "attempt": job.attempt_count + 1,
+                                "retry_in_seconds": delay,
+                                "error_type": type(error).__name__,
+                                "error": str(error) or "background job failed",
+                            },
+                        )
+                    )
                     await app.state.store.retry_job(
                         job.tenant_id,
                         job.id,
@@ -731,6 +800,7 @@ def create_app(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
         if await runtime_store.get_conversation(body.tenant_id, conversation_id) is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "conversation not found")
+        request.app.state.session_audit.begin(body.client_request_id, body.tenant_id, body.content)
         user_message, turn = await request.app.state.orchestrator.start_turn(
             body.tenant_id,
             principal.user_id,
@@ -738,6 +808,7 @@ def create_app(
             body.client_request_id,
             body.content,
         )
+        request.app.state.session_audit.attach_message(body.client_request_id, user_message.id)
         run_lease_id = uuid4()
         claimed = await runtime_store.claim_turn(
             body.tenant_id, turn.id, run_lease_id, datetime.now(UTC) + timedelta(minutes=5)
@@ -760,6 +831,14 @@ def create_app(
                 yield "event: error\ndata: {\"message\": \"model provider failed\"}\n\n"
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @api.get("/audit/{trace_id}", tags=["audit"])
+    async def get_session_audit(
+        trace_id: UUID, principal: Annotated[UserPrincipal, Depends(_user_principal)]
+    ) -> dict[str, object]:
+        if not app.state.session_audit.belongs_to(trace_id, principal.tenant_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "audit trace not found")
+        return {"trace_id": str(trace_id), "events": app.state.session_audit.get(trace_id)}
 
     @api.get(
         "/conversations/{conversation_id}/turns",

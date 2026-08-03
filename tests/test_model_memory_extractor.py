@@ -42,3 +42,16 @@ async def test_model_extractor_falls_back_on_invalid_output() -> None:
 
     extracted = await ModelBackedMemoryExtractor(InvalidProvider()).extract("I prefer concise text")
     assert extracted[0].content == "concise text"
+
+
+async def test_model_extractor_accepts_json_wrapped_in_prose() -> None:
+    class WrappedProvider:
+        async def process(self, instruction: str, content: str) -> str:
+            return (
+                "Here is the extraction:\n```json\n"
+                '[{"kind":"fact","content":"water plants nightly",'
+                '"confidence":0.9,"promoted":true}]\n```'
+            )
+
+    extracted = await ModelBackedMemoryExtractor(WrappedProvider()).extract("Remember my plants")
+    assert extracted[0].content == "water plants nightly"

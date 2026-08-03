@@ -1,8 +1,9 @@
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 import httpx
@@ -225,15 +226,29 @@ Only promote explicit user requests or unambiguous preferences/project facts.
 Do not infer sensitive facts. Return [] when nothing should be remembered."""
 
     def __init__(
-        self, provider: LocalModelProvider, fallback: MemoryExtractor | None = None
+        self,
+        provider: LocalModelProvider,
+        fallback: MemoryExtractor | None = None,
+        audit: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._provider = provider
         self._fallback = fallback or DeterministicMemoryExtractor()
+        self._audit = audit
 
     async def extract(self, content: str) -> tuple[ExtractedMemory, ...]:
         try:
+            if self._audit is not None:
+                self._audit(
+                    "local_model.request", {"instruction": self._instruction, "content": content}
+                )
             raw = await self._provider.process(self._instruction, content)
-            parsed = json.loads(raw)
+            if self._audit is not None:
+                self._audit("local_model.response", {"input": content, "content": raw})
+            # Instruction-tuned local models commonly wrap otherwise-valid JSON in prose or fences.
+            start, end = raw.find("["), raw.rfind("]")
+            if start < 0 or end < start:
+                raise ValueError("memory extraction returned no JSON array")
+            parsed = json.loads(raw[start : end + 1])
             if not isinstance(parsed, list):
                 raise ValueError("memory extraction must return an array")
             results = []
@@ -251,7 +266,9 @@ Do not infer sensitive facts. Return [] when nothing should be remembered."""
             if any(not item.content or not 0 <= item.confidence <= 1 for item in results):
                 raise ValueError("invalid memory candidate")
             return tuple(results)
-        except Exception:
+        except Exception as error:
+            if self._audit is not None:
+                self._audit("local_model.failed", {"input": content, "error": str(error)})
             return await self._fallback.extract(content)
 
 
@@ -261,10 +278,12 @@ class MemoryPipeline:
         repository: MemoryRepository,
         extractor: MemoryExtractor,
         vector_index: VectorIndex,
+        audit: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._repository = repository
         self._extractor = extractor
         self._vector_index = vector_index
+        self._audit = audit
 
     async def extract_message(
         self, tenant_id: UUID, source_event_id: UUID, source_message_id: UUID, content: str
@@ -311,8 +330,12 @@ class MemoryPipeline:
     async def sync_memory(self, memory: MemoryRecord) -> None:
         if memory.state is MemoryState.PROMOTED:
             await self._vector_index.upsert(memory, deterministic_embedding(memory.content))
+            if self._audit is not None:
+                self._audit("memory.vector_sync", {"memory": memory.model_dump(mode="json")})
         elif memory.state is MemoryState.DELETED:
             await self._vector_index.delete(memory.id)
+            if self._audit is not None:
+                self._audit("memory.vector_delete", {"memory": memory.model_dump(mode="json")})
 
 
 class MemoryContextCompiler:
@@ -323,16 +346,19 @@ class MemoryContextCompiler:
         persona_kernel: str,
         max_tokens: int = 800,
         memory_limit: int = 8,
+        audit: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._repository = repository
         self._vector_index = vector_index
         self._persona_kernel = persona_kernel.strip()
         self._max_tokens = max_tokens
         self._memory_limit = memory_limit
+        self._audit = audit
 
     async def compile(self, tenant_id: UUID, objective: str) -> ContextBriefing:
         authorized = await self._repository.list_memories(tenant_id, include_candidates=False)
         by_id = {item.id: item for item in authorized if item.visibility == "private"}
+        qdrant_available = True
         try:
             ranked_ids = await self._vector_index.rank(
                 tenant_id,
@@ -344,16 +370,29 @@ class MemoryContextCompiler:
         except Exception:
             # Vector availability must not prevent a safe lexical recall.
             ranked_ids = ()
-        ranked = [by_id[item] for item in ranked_ids if item in by_id]
-        if not ranked:
-            terms = set(re.findall(r"[a-z0-9_]+", objective.casefold()))
-            ranked = sorted(
-                by_id.values(),
-                key=lambda item: len(
-                    terms.intersection(re.findall(r"[a-z0-9_]+", item.content.casefold()))
-                ),
-                reverse=True,
-            )[: self._memory_limit]
+            qdrant_available = False
+        # Current vectors are deterministic hashes, not semantic embeddings. Keep Qdrant observable
+        # for migration diagnostics, but use lexical relevance for safe, predictable recall.
+        terms = set(re.findall(r"[a-z0-9_]+", objective.casefold()))
+        ranked = sorted(
+            by_id.values(),
+            key=lambda item: (
+                -len(terms.intersection(re.findall(r"[a-z0-9_]+", item.content.casefold()))),
+                str(item.id),
+            ),
+        )[: self._memory_limit]
+        if self._audit is not None:
+            self._audit(
+                "memory.ranking",
+                {
+                    "objective": objective,
+                    "strategy": "lexical",
+                    "qdrant_available": qdrant_available,
+                    "authorized_memory_ids": [str(item) for item in by_id],
+                    "qdrant_ranked_memory_ids": [str(item) for item in ranked_ids],
+                    "selected_memory_ids": [str(item.id) for item in ranked],
+                },
+            )
         profile = await self._repository.get_active_persona(tenant_id)
         persona = (
             f"{persona_identity_prefix()}\nPersona guidance: {self._persona_kernel}"
