@@ -43,6 +43,22 @@ uv run astra-tui
 API documentation is available at `http://127.0.0.1:8000/docs`; health is available at
 `http://127.0.0.1:8000/health`.
 
+### Interactive installer
+
+For a local single-host installation, run:
+
+```bash
+bash install.sh
+```
+
+The installer interactively selects a local or Docker controller, an existing MariaDB instance or
+a new MariaDB container, and optional OpenRouter credentials/model. Qdrant always runs in Docker.
+It stores the generated Compose definition and private environment file under
+`~/.config/astra-agent` (or `ASTRA_INSTALL_DIR`), then installs `astra-tui` and the `agent-tui`
+alias in `/usr/bin`; it will request `sudo` for those launchers. For an existing database, enter a
+SQLAlchemy URL reachable from the selected controller: a Docker controller cannot use
+`127.0.0.1` to reach a database running on the host.
+
 ## MariaDB
 
 ```bash
