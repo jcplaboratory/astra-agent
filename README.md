@@ -67,6 +67,20 @@ configured roles, generate the CA when the mount is new, and issue ingress and A
 For an existing centrally managed PKI mount, use the mount and role names approved by its operator;
 the installer will update those roles with Astra's required server/client constraints.
 
+### Keycloak realm import
+
+Import [`deploy/keycloak-production-realm.json`](deploy/keycloak-production-realm.json) into
+Keycloak before running the installer. It creates the `astra-agent` realm and an `astra-agent`
+OIDC client, disables direct password grants and self-registration, requires external TLS, and adds
+the `tenant_id` token claim plus the `astra-agent` audience required by the controller. It contains
+no users, passwords, redirect URIs, or secrets.
+
+After import, create each user through your approved identity-management process and set its
+`tenant_id` user attribute to the UUID of its Astra tenant. Configure the client's valid redirect
+URIs and web origins only when using a browser-based OIDC client; the terminal `astra` client uses
+an access token supplied in `ASTRA_ACCESS_TOKEN`. Configure production password, MFA, email, and
+identity-provider policies in Keycloak according to your organization's requirements.
+
 The installer writes a root-only environment file and Compose definition to `/etc/astra-agent`
 (override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs the `astra`
 launcher in `/usr/bin`. It deliberately leaves user-facing HTTPS termination to the
