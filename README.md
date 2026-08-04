@@ -4,6 +4,8 @@
 
 <h1 align="center">Astra Agent</h1>
 
+> ⚠️ **Work in progress** — Astra Agent is under active development. APIs, schemas, and deployment workflows may change. Not yet recommended for production use. Watch this repo for updates.
+
 Astra Agent is a hosted, multi-tenant Distributed Enriched-Persona Agent (D.E.P.A.). The
 Astra Agent control plane owns conversation, task, memory, policy, and audit state. Authenticated
 Astra Remote Agents (ARA) pull bounded leases and operate with explicitly scoped capabilities.
@@ -67,20 +69,6 @@ configured roles, generate the CA when the mount is new, and issue ingress and A
 For an existing centrally managed PKI mount, use the mount and role names approved by its operator;
 the installer will update those roles with Astra's required server/client constraints.
 
-### Keycloak realm import
-
-Import [`deploy/keycloak-production-realm.json`](deploy/keycloak-production-realm.json) into
-Keycloak before running the installer. It creates the `astra-agent` realm and an `astra-agent`
-OIDC client, disables direct password grants and self-registration, requires external TLS, and adds
-the `tenant_id` token claim plus the `astra-agent` audience required by the controller. It contains
-no users, passwords, redirect URIs, or secrets.
-
-After import, create each user through your approved identity-management process and set its
-`tenant_id` user attribute to the UUID of its Astra tenant. Configure the client's valid redirect
-URIs and web origins only when using a browser-based OIDC client; the terminal `astra` client uses
-an access token supplied in `ASTRA_ACCESS_TOKEN`. Configure production password, MFA, email, and
-identity-provider policies in Keycloak according to your organization's requirements.
-
 The installer writes a root-only environment file and Compose definition to `/etc/astra-agent`
 (override with `ASTRA_INSTALL_DIR`), starts the Dockerized services, and installs the `astra`
 launcher in `/usr/bin`. It deliberately leaves user-facing HTTPS termination to the
@@ -92,7 +80,7 @@ controller: a Docker controller cannot use `127.0.0.1` to reach a database runni
 ```bash
 export MARIADB_ROOT_PASSWORD='choose-a-local-password'
 docker compose up -d mariadb
-export ASTRA_DATABASE_URL='mysql+aiomysql://root:choose-a-local-password@127.0.0.1:3306/astra_agent?charset=utf8mb4'
+export ASTRA_DATABASE_URL='mysql+aiomysql://root:***@127.0.0.1:3306/astra_agent?charset=utf8mb4'
 uv run alembic upgrade head
 export ASTRA_PERSISTENCE_BACKEND=mariadb
 uv run astra-agent
