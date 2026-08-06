@@ -8,10 +8,14 @@ from astra_domain import (
     Approval,
     ApprovalState,
     AuditEvent,
+    BackgroundJob,
+    BackgroundJobKind,
     Capability,
     CapabilityKind,
     Conversation,
     ConversationMessage,
+    ConversationTurn,
+    ConversationTurnState,
     EventType,
     MemoryKind,
     MemoryRecord,
@@ -22,6 +26,8 @@ from astra_domain import (
     RemoteAgent,
     Task,
     TaskState,
+    ToolInvocation,
+    ToolInvocationTarget,
 )
 from astra_runtime import LifecycleConflictError, MariaDBRuntimeStore, create_schema
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -127,6 +133,100 @@ async def test_mariadb_ara_lifecycle_is_atomic() -> None:
             tenant_id, ara.id, task.id, lease.id, TaskState.COMPLETED, "duplicate"
         )
     await store.close()
+
+
+@pytest.mark.skipif(
+    not os.getenv("ASTRA_TEST_DATABASE_URL"), reason="MariaDB test URL not configured"
+)
+async def test_mariadb_delegated_task_completion_resumes_turn() -> None:
+    engine = create_async_engine(os.environ["ASTRA_TEST_DATABASE_URL"], pool_pre_ping=True)
+    store = MariaDBRuntimeStore(engine)
+    try:
+        tenant_id, user_id = uuid4(), uuid4()
+        capability = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
+        ara = RemoteAgent(
+            tenant_id=tenant_id,
+            name="delegation-ara",
+            runtime_version="1",
+            capabilities=(capability,),
+        )
+        await store.register_ara(
+            ara,
+            AuditEvent(
+                tenant_id=tenant_id,
+                event_type=EventType.ARA_REGISTERED,
+                actor_type=ActorType.ARA,
+                actor_id=ara.id,
+            ),
+        )
+        conversation = Conversation(tenant_id=tenant_id, user_id=user_id)
+        await store.create_conversation(
+            conversation,
+            AuditEvent(
+                tenant_id=tenant_id,
+                event_type=EventType.CONVERSATION_CREATED,
+                actor_type=ActorType.USER,
+                actor_id=user_id,
+            ),
+        )
+        message = ConversationMessage(
+            tenant_id=tenant_id,
+            conversation_id=conversation.id,
+            role=MessageRole.USER,
+            content="inspect the repository",
+        )
+        turn = ConversationTurn(
+            tenant_id=tenant_id,
+            conversation_id=conversation.id,
+            user_message_id=message.id,
+            client_request_id=uuid4(),
+        )
+        await store.create_turn(
+            message,
+            turn,
+            (),
+            BackgroundJob(
+                tenant_id=tenant_id,
+                kind=BackgroundJobKind.MEMORY_EXTRACTION,
+                source_id=message.id,
+            ),
+        )
+        run_lease_id = uuid4()
+        claimed = await store.claim_pending_turn(
+            tenant_id, run_lease_id, datetime.now(UTC) + timedelta(minutes=5)
+        )
+        assert claimed is not None
+        task = Task(
+            tenant_id=tenant_id,
+            objective="inspect",
+            deliverable_contract="report",
+            required_capabilities=(capability,),
+        )
+        invocation = ToolInvocation(
+            tenant_id=tenant_id,
+            turn_id=turn.id,
+            task_id=task.id,
+            tool_call_id="delegation-1",
+            tool_name="delegate_ara",
+            target=ToolInvocationTarget.ARA,
+            arguments={"objective": task.objective},
+            arguments_sha256="0" * 64,
+        )
+        await store.create_delegated_tasks(
+            tenant_id, turn.id, run_lease_id, (task,), (invocation,), {"messages": []}
+        )
+        stored_invocation = await store.get_tool_invocation(tenant_id, turn.id, "delegation-1")
+        assert stored_invocation is not None
+        assert stored_invocation.task_id == task.id
+        leased = await store.lease_task(tenant_id, ara.id, datetime.now(UTC) + timedelta(minutes=1))
+        assert leased is not None
+        _, lease = leased
+        await store.finish_task(tenant_id, ara.id, task.id, lease.id, TaskState.COMPLETED, "done")
+        resumed = await store.get_turn(tenant_id, turn.id)
+        assert resumed is not None
+        assert resumed.state is ConversationTurnState.PENDING
+    finally:
+        await store.close()
 
 
 @pytest.mark.skipif(
