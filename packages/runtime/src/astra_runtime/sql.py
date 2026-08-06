@@ -1385,6 +1385,41 @@ class MariaDBRuntimeStore:
             ).all()
         return tuple(_attempt(row) for row in rows)
 
+    async def requeue_job(self, tenant_id: UUID, job_id: UUID, actor_id: UUID) -> BackgroundJob:
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(BackgroundJobRow)
+                .where(
+                    BackgroundJobRow.id == str(job_id), BackgroundJobRow.tenant_id == str(tenant_id)
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise LifecycleNotFoundError("job not found")
+            if row.state is not BackgroundJobState.FAILED:
+                raise LifecycleConflictError("only failed jobs can be requeued")
+            now = _naive_utc(datetime.now(UTC))
+            row.state = BackgroundJobState.PENDING
+            row.attempt_count = 0
+            row.available_at = now
+            row.lease_id = None
+            row.lease_expires_at = None
+            row.last_error = None
+            row.completed_at = None
+            row.updated_at = now
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.JOB_REQUEUED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"job_id": str(job_id)},
+                    )
+                )
+            )
+            return _job(row)
+
     async def get_memory(self, tenant_id: UUID, memory_id: UUID) -> MemoryRecord | None:
         async with self._sessions() as session:
             row = await session.scalar(
@@ -2106,6 +2141,11 @@ class MariaDBRuntimeStore:
 
     async def register_ara(self, remote_agent: RemoteAgent, event: AuditEvent) -> RemoteAgent:
         async with self._sessions.begin() as session:
+            existing = await session.get(RemoteAgentRow, str(remote_agent.id))
+            if existing is not None and existing.tenant_id == str(remote_agent.tenant_id):
+                remote_agent = remote_agent.model_copy(
+                    update={"status": existing.status, "trust_level": existing.trust_level}
+                )
             await session.merge(_remote_agent_row(remote_agent))
             session.add(_event_row(event))
         return remote_agent
@@ -2206,6 +2246,73 @@ class MariaDBRuntimeStore:
             else _remote_agent(row)
             for row in rows
         )
+
+    async def set_remote_agent_trust(
+        self, tenant_id: UUID, ara_id: UUID, trust_level: int, actor_id: UUID
+    ) -> RemoteAgent:
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(RemoteAgentRow)
+                .where(RemoteAgentRow.id == str(ara_id), RemoteAgentRow.tenant_id == str(tenant_id))
+                .with_for_update()
+            )
+            if row is None:
+                raise LifecycleNotFoundError("ARA not found")
+            if row.status is RemoteAgentStatus.REVOKED:
+                raise LifecycleConflictError("revoked ARA cannot regain trust")
+            row.trust_level = trust_level
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.ARA_TRUST_UPDATED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"ara_id": str(ara_id), "trust_level": trust_level},
+                    )
+                )
+            )
+            return _remote_agent(row)
+
+    async def revoke_remote_agent(
+        self, tenant_id: UUID, ara_id: UUID, actor_id: UUID
+    ) -> RemoteAgent:
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(RemoteAgentRow)
+                .where(RemoteAgentRow.id == str(ara_id), RemoteAgentRow.tenant_id == str(tenant_id))
+                .with_for_update()
+            )
+            if row is None:
+                raise LifecycleNotFoundError("ARA not found")
+            row.status = RemoteAgentStatus.REVOKED
+            row.trust_level = 0
+            await session.execute(
+                select(LeaseRow)
+                .where(LeaseRow.tenant_id == str(tenant_id), LeaseRow.ara_id == str(ara_id))
+                .with_for_update()
+            )
+            now = _naive_utc(datetime.now(UTC))
+            for lease in (
+                await session.scalars(
+                    select(LeaseRow).where(
+                        LeaseRow.tenant_id == str(tenant_id), LeaseRow.ara_id == str(ara_id)
+                    )
+                )
+            ).all():
+                lease.expires_at = now
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.ARA_REVOKED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"ara_id": str(ara_id)},
+                    )
+                )
+            )
+            return _remote_agent(row)
 
     async def get_artifact(self, tenant_id: UUID, artifact_id: UUID) -> Artifact | None:
         async with self._sessions() as session:
@@ -2361,6 +2468,8 @@ class MariaDBRuntimeStore:
                 LeaseRow.ara_id == str(ara_id),
                 RemoteAgentRow.id == str(ara_id),
                 RemoteAgentRow.tenant_id == str(tenant_id),
+                RemoteAgentRow.status == RemoteAgentStatus.ACTIVE,
+                RemoteAgentRow.trust_level > 0,
             )
             .with_for_update()
         )

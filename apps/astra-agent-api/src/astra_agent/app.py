@@ -89,8 +89,9 @@ from astra_runtime import (
     create_schema,
 )
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from astra_agent.artifacts import ArtifactStore, S3ArtifactStore
@@ -120,6 +121,47 @@ class HealthResponse(BaseModel):
 class TaskCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task: Task
+
+
+class AdminIdentityResponse(BaseModel):
+    tenant_id: UUID
+    user_id: UUID
+    subject: str
+    roles: tuple[str, ...]
+
+
+class AdminOverviewResponse(BaseModel):
+    tenant_id: UUID
+    tasks: int
+    pending_approvals: int
+    active_aras: int
+    failed_jobs: int
+    artifacts_enabled: bool
+    qdrant_enabled: bool
+    model_backend: str
+    sandbox_enabled: bool
+    sandbox_timeout_seconds: int
+
+
+class AdminOperationsResponse(BaseModel):
+    tasks: tuple[Task, ...]
+    approvals: tuple[Approval, ...]
+    remote_agents: tuple[RemoteAgent, ...]
+    jobs: tuple[BackgroundJob, ...]
+    memories: tuple[MemoryRecord, ...]
+    events: tuple[AuditEvent, ...]
+    artifacts: tuple[ArtifactMetadataResponse, ...]
+
+
+class TrustRequest(BaseModel):
+    trust_level: int = Field(ge=0, le=100)
+
+
+class AdminTaskDetailResponse(BaseModel):
+    task: Task
+    events: tuple[AuditEvent, ...]
+    artifacts: tuple[ArtifactMetadataResponse, ...]
+    progress: tuple[AuditEvent, ...]
 
 
 class ARAMessage(Protocol):
@@ -160,6 +202,16 @@ def _principal_dependency(settings: Settings) -> Callable[..., object]:
 async def _user_principal(request: Request) -> UserPrincipal:
     authenticator: UserAuthenticator = request.app.state.user_authenticator
     return await authenticator.authenticate(request)
+
+
+def _require_operator(principal: UserPrincipal) -> None:
+    if not principal.roles.intersection({"platform_operator", "tenant_admin", "auditor"}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "an Astra operator role is required")
+
+
+def _require_operator_mutation(principal: UserPrincipal) -> None:
+    if not principal.roles.intersection({"platform_operator", "tenant_admin"}):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "a mutating operator role is required")
 
 
 def create_app(
@@ -235,6 +287,7 @@ def create_app(
                 settings.local_model_name,
                 settings.local_model_api_key,
             )
+
             def audit_local_model(stage: str, payload: dict[str, object]) -> None:
                 content = payload.get("input", payload.get("content"))
                 if isinstance(content, str):
@@ -261,6 +314,7 @@ def create_app(
             extractor = ModelBackedMemoryExtractor(
                 app.state.local_model_provider, audit=audit_local_model
             )
+
         def audit_vector_sync(stage: str, payload: dict[str, object]) -> None:
             memory = payload.get("memory")
             if isinstance(memory, dict) and isinstance(memory.get("source_message_id"), str):
@@ -271,6 +325,7 @@ def create_app(
         app.state.memory_pipeline = MemoryPipeline(
             app.state.store, extractor, app.state.vector_index, audit=audit_vector_sync
         )
+
         def audit_memory_ranking(stage: str, payload: dict[str, object]) -> None:
             objective = payload.pop("objective", None)
             if isinstance(objective, str):
@@ -429,6 +484,14 @@ def create_app(
         await app.state.store.close()
 
     app = FastAPI(title="Astra Agent", version="0.1.0", lifespan=lifespan)
+    if settings.console_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.console_origins),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -437,8 +500,218 @@ def create_app(
         )
 
     api = APIRouter(prefix="/api/v1")
+    admin_api = APIRouter(prefix="/admin", tags=["admin"])
     ara_api = APIRouter(prefix="/aras", tags=["aras"])
     principal_dependency = _principal_dependency(settings)
+
+    @admin_api.get("/me", response_model=AdminIdentityResponse)
+    async def admin_identity(
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+    ) -> AdminIdentityResponse:
+        _require_operator(principal)
+        return AdminIdentityResponse(
+            tenant_id=principal.tenant_id,
+            user_id=principal.user_id,
+            subject=principal.subject,
+            roles=tuple(sorted(principal.roles)),
+        )
+
+    @admin_api.get("/overview", response_model=AdminOverviewResponse)
+    async def admin_overview(
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+        request: Request,
+    ) -> AdminOverviewResponse:
+        _require_operator(principal)
+        tasks, approvals, aras, jobs = await asyncio.gather(
+            runtime_store.list_tasks(principal.tenant_id),
+            runtime_store.list_approvals(principal.tenant_id),
+            runtime_store.list_remote_agents(principal.tenant_id),
+            runtime_store.list_jobs(principal.tenant_id),
+        )
+        current_settings: Settings = request.app.state.settings
+        return AdminOverviewResponse(
+            tenant_id=principal.tenant_id,
+            tasks=len(tasks),
+            pending_approvals=sum(item.state is ApprovalState.PENDING for item in approvals),
+            active_aras=sum(item.status.value == "active" for item in aras),
+            failed_jobs=sum(item.state.value == "failed" for item in jobs),
+            artifacts_enabled=bool(current_settings.artifact_bucket),
+            qdrant_enabled=current_settings.memory_backend == "qdrant",
+            model_backend=current_settings.model_backend,
+            sandbox_enabled=current_settings.sandbox_executable is not None,
+            sandbox_timeout_seconds=current_settings.sandbox_timeout_seconds,
+        )
+
+    @admin_api.get("/operations", response_model=AdminOperationsResponse)
+    async def admin_operations(
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> AdminOperationsResponse:
+        _require_operator(principal)
+        tasks, approvals, remote_agents, jobs, memories, events, artifacts = await asyncio.gather(
+            runtime_store.list_tasks(principal.tenant_id),
+            runtime_store.list_approvals(principal.tenant_id),
+            runtime_store.list_remote_agents(principal.tenant_id),
+            runtime_store.list_jobs(principal.tenant_id),
+            runtime_store.list_memories(principal.tenant_id, include_candidates=True),
+            runtime_store.list_events(principal.tenant_id),
+            runtime_store.list_artifacts(principal.tenant_id),
+        )
+        return AdminOperationsResponse(
+            tasks=tasks,
+            approvals=approvals,
+            remote_agents=remote_agents,
+            jobs=jobs,
+            memories=memories,
+            events=events,
+            artifacts=tuple(
+                ArtifactMetadataResponse(
+                    **item.model_dump(exclude={"tenant_id", "object_key", "deleted_at"})
+                )
+                for item in artifacts
+            ),
+        )
+
+    @admin_api.get("/tasks/{task_id}", response_model=AdminTaskDetailResponse)
+    async def admin_task_detail(
+        task_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> AdminTaskDetailResponse:
+        _require_operator(principal)
+        task = await runtime_store.get_task(principal.tenant_id, task_id)
+        if task is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "task not found")
+        events, artifacts = await asyncio.gather(
+            runtime_store.list_events(principal.tenant_id),
+            runtime_store.list_artifacts(principal.tenant_id),
+        )
+        task_events = tuple(item for item in events if item.task_id == task_id)
+        return AdminTaskDetailResponse(
+            task=task,
+            events=task_events,
+            progress=tuple(
+                item for item in task_events if item.event_type is EventType.ARA_PROGRESS
+            ),
+            artifacts=tuple(
+                ArtifactMetadataResponse(
+                    **item.model_dump(exclude={"tenant_id", "object_key", "deleted_at"})
+                )
+                for item in artifacts
+                if item.task_id == task_id
+            ),
+        )
+
+    @admin_api.post("/jobs/{job_id}/requeue", response_model=BackgroundJob)
+    async def admin_requeue_job(
+        job_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> BackgroundJob:
+        _require_operator_mutation(principal)
+        try:
+            return await runtime_store.requeue_job(principal.tenant_id, job_id, principal.user_id)
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @admin_api.post("/aras/{ara_id}/trust", response_model=RemoteAgent)
+    async def admin_set_ara_trust(
+        ara_id: UUID,
+        body: TrustRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> RemoteAgent:
+        _require_operator_mutation(principal)
+        try:
+            return await runtime_store.set_remote_agent_trust(
+                principal.tenant_id, ara_id, body.trust_level, principal.user_id
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @admin_api.post("/aras/{ara_id}/revoke", response_model=RemoteAgent)
+    async def admin_revoke_ara(
+        ara_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> RemoteAgent:
+        _require_operator_mutation(principal)
+        try:
+            return await runtime_store.revoke_remote_agent(
+                principal.tenant_id, ara_id, principal.user_id
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @admin_api.post("/approvals/{approval_id}/decision", response_model=ApprovalResponse)
+    async def admin_decide_approval(
+        approval_id: UUID,
+        body: ApprovalDecisionRequest,
+        request: Request,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> ApprovalResponse:
+        _require_operator_mutation(principal)
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            approval = await runtime_store.decide_approval(
+                body.tenant_id,
+                approval_id,
+                ApprovalState.GRANTED if body.granted else ApprovalState.DENIED,
+                principal.user_id,
+            )
+            if approval.tool_invocation_id is not None:
+                request.app.state.advance_turn(body.tenant_id)
+            return ApprovalResponse(approval=approval)
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @admin_api.post("/tasks/{task_id}/cancel", response_model=TaskLifecycleResponse)
+    async def admin_cancel_task(
+        task_id: UUID,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> TaskLifecycleResponse:
+        _require_operator_mutation(principal)
+        try:
+            task = await runtime_store.request_task_cancellation(
+                principal.tenant_id, task_id, principal.user_id
+            )
+            return TaskLifecycleResponse(task_id=task.id, state=task.state)
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+
+    @admin_api.post("/memories/{memory_id}/review", response_model=MemoryRecord)
+    async def admin_review_memory(
+        memory_id: UUID,
+        body: MemoryReviewRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> MemoryRecord:
+        _require_operator_mutation(principal)
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            reviewed = await runtime_store.review_memory(
+                body.tenant_id,
+                memory_id,
+                body.promote,
+                principal.user_id,
+                body.replaces_memory_id,
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
+        if reviewed.state is MemoryState.PROMOTED:
+            await runtime_store.enqueue_job(
+                BackgroundJob(
+                    tenant_id=body.tenant_id,
+                    kind=BackgroundJobKind.VECTOR_SYNC,
+                    source_id=reviewed.id,
+                )
+            )
+        return reviewed
 
     def raise_lifecycle_error(error: Exception) -> NoReturn:
         if isinstance(error, LifecycleNotFoundError):
@@ -828,7 +1101,7 @@ def create_app(
                     yield f"event: {event.kind}\ndata: {json.dumps(payload)}\n\n"
                 yield "event: done\ndata: {}\n\n"
             except ModelProviderError:
-                yield "event: error\ndata: {\"message\": \"model provider failed\"}\n\n"
+                yield 'event: error\ndata: {"message": "model provider failed"}\n\n'
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -1284,6 +1557,7 @@ def create_app(
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
 
+    api.include_router(admin_api)
     api.include_router(ara_api)
     app.include_router(api)
     return app

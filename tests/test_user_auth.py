@@ -37,6 +37,7 @@ def _token(
     *,
     audience: str = "astra-agent-api",
     expires_delta: timedelta = timedelta(minutes=5),
+    roles: list[str] | None = None,
 ) -> str:
     now = datetime.now(UTC)
     return jwt.encode(
@@ -45,6 +46,7 @@ def _token(
             "aud": audience,
             "sub": "user-123",
             "tenant_id": tenant_id,
+            "realm_access": {"roles": roles or []},
             "iat": now,
             "exp": now + expires_delta,
         },
@@ -104,3 +106,22 @@ def test_development_user_routes_are_not_anonymous_or_cross_tenant() -> None:
         assert (
             client.get(f"/api/v1/tenants/{other_tenant}/events", headers=headers).status_code == 403
         )
+
+
+def test_admin_routes_require_operator_role() -> None:
+    settings, authenticator, private_key = _oidc_setup()
+    tenant_id = uuid4()
+    with TestClient(create_app(settings=settings, user_authenticator=authenticator)) as client:
+        user_token = _token(private_key, str(tenant_id))
+        operator_token = _token(private_key, str(tenant_id), roles=["platform_operator"])
+        assert (
+            client.get(
+                "/api/v1/admin/overview", headers={"Authorization": f"Bearer {user_token}"}
+            ).status_code
+            == 403
+        )
+        response = client.get(
+            "/api/v1/admin/overview", headers={"Authorization": f"Bearer {operator_token}"}
+        )
+        assert response.status_code == 200
+        assert response.json()["tenant_id"] == str(tenant_id)

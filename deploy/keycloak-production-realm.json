@@ -12,6 +12,22 @@
   "resetPasswordAllowed": true,
   "bruteForceProtected": true,
   "permanentLockout": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "platform_operator",
+        "description": "May operate Astra platform controls for the token tenant"
+      },
+      {
+        "name": "tenant_admin",
+        "description": "May operate Astra tenant controls for the token tenant"
+      },
+      {
+        "name": "auditor",
+        "description": "May view Astra tenant operational state without mutations"
+      }
+    ]
+  },
   "clients": [
     {
       "clientId": "astra-agent",
@@ -25,6 +41,49 @@
       "serviceAccountsEnabled": false,
       "redirectUris": [],
       "webOrigins": [],
+      "protocolMappers": [
+        {
+          "name": "tenant-id",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "access.token.claim": "true",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "astra-agent-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "astra-agent",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "astra-console",
+      "name": "Astra Operator Console",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "implicitFlowEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
       "protocolMappers": [
         {
           "name": "tenant-id",

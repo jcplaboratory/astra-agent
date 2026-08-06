@@ -17,6 +17,8 @@ work.
 - [Coordinator Local Tool Execution](coordinator-tool-execution.md): planned — making the
   coordinator a first-class tool executor with a model-driven loop, shared capability model,
   and unified local/ARA dispatch.
+- [Operator Console](operator-console.md): local console setup, OIDC access, roles, operational
+  workstreams, and administrative boundaries.
 
 ## Status Legend
 

@@ -27,6 +27,7 @@ class UserPrincipal:
     tenant_id: UUID
     user_id: UUID
     subject: str
+    roles: frozenset[str] = frozenset()
 
 
 class UserAuthenticator(Protocol):
@@ -71,7 +72,12 @@ async def development_user_principal(
 ) -> UserPrincipal:
     if tenant_id is None or user_id is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "development user headers are required")
-    return UserPrincipal(tenant_id=tenant_id, user_id=user_id, subject=str(user_id))
+    return UserPrincipal(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        subject=str(user_id),
+        roles=frozenset({"platform_operator"}),
+    )
 
 
 class DevelopmentUserAuthenticator:
@@ -83,7 +89,12 @@ class DevelopmentUserAuthenticator:
             raise HTTPException(
                 status.HTTP_401_UNAUTHORIZED, "development user headers are required"
             ) from error
-        return UserPrincipal(tenant_id=tenant_id, user_id=user_id, subject=str(user_id))
+        return UserPrincipal(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            subject=str(user_id),
+            roles=frozenset({"platform_operator"}),
+        )
 
     async def close(self) -> None:
         return None
@@ -164,12 +175,17 @@ class OIDCUserAuthenticator:
             tenant_id = UUID(claims[self._tenant_claim])
             if not isinstance(subject, str) or not subject:
                 raise InvalidTokenError("invalid subject")
+            realm_access = claims.get("realm_access", {})
+            roles = realm_access.get("roles", []) if isinstance(realm_access, dict) else []
+            if not isinstance(roles, list) or not all(isinstance(role, str) for role in roles):
+                raise InvalidTokenError("invalid role claims")
         except (InvalidTokenError, KeyError, TypeError, ValueError) as error:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid bearer token") from error
         return UserPrincipal(
             tenant_id=tenant_id,
             user_id=uuid5(NAMESPACE_URL, f"{self._issuer}:{subject}"),
             subject=subject,
+            roles=frozenset(roles),
         )
 
     async def close(self) -> None:

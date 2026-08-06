@@ -484,6 +484,38 @@ class InMemoryRuntimeStore:
                 return ()
             return tuple(self._job_attempts.get(job_id, ()))
 
+    async def requeue_job(self, tenant_id: UUID, job_id: UUID, actor_id: UUID) -> BackgroundJob:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("job not found")
+            if job.state is not BackgroundJobState.FAILED:
+                raise LifecycleConflictError("only failed jobs can be requeued")
+            now = datetime.now(UTC)
+            requeued = job.model_copy(
+                update={
+                    "state": BackgroundJobState.PENDING,
+                    "attempt_count": 0,
+                    "available_at": now,
+                    "lease_id": None,
+                    "lease_expires_at": None,
+                    "last_error": None,
+                    "completed_at": None,
+                    "updated_at": now,
+                }
+            )
+            self._jobs[job_id] = requeued
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.JOB_REQUEUED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"job_id": str(job_id)},
+                )
+            )
+            return requeued
+
     async def get_memory(self, tenant_id: UUID, memory_id: UUID) -> MemoryRecord | None:
         async with self._lock:
             memory = self._memories.get(memory_id)
@@ -1092,6 +1124,11 @@ class InMemoryRuntimeStore:
 
     async def register_ara(self, remote_agent: RemoteAgent, event: AuditEvent) -> RemoteAgent:
         async with self._lock:
+            existing = self._remote_agents.get(remote_agent.id)
+            if existing is not None and existing.tenant_id == remote_agent.tenant_id:
+                remote_agent = remote_agent.model_copy(
+                    update={"status": existing.status, "trust_level": existing.trust_level}
+                )
             self._remote_agents[remote_agent.id] = remote_agent
             self._events.append(event)
         return remote_agent
@@ -1175,6 +1212,53 @@ class InMemoryRuntimeStore:
                 for agent in self._remote_agents.values()
                 if agent.tenant_id == tenant_id
             )
+
+    async def set_remote_agent_trust(
+        self, tenant_id: UUID, ara_id: UUID, trust_level: int, actor_id: UUID
+    ) -> RemoteAgent:
+        async with self._lock:
+            ara = self._remote_agents.get(ara_id)
+            if ara is None or ara.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("ARA not found")
+            if ara.status is RemoteAgentStatus.REVOKED:
+                raise LifecycleConflictError("revoked ARA cannot regain trust")
+            updated = ara.model_copy(update={"trust_level": trust_level})
+            self._remote_agents[ara_id] = updated
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.ARA_TRUST_UPDATED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"ara_id": str(ara_id), "trust_level": trust_level},
+                )
+            )
+            return updated
+
+    async def revoke_remote_agent(
+        self, tenant_id: UUID, ara_id: UUID, actor_id: UUID
+    ) -> RemoteAgent:
+        async with self._lock:
+            ara = self._remote_agents.get(ara_id)
+            if ara is None or ara.tenant_id != tenant_id:
+                raise LifecycleNotFoundError("ARA not found")
+            revoked = ara.model_copy(update={"status": RemoteAgentStatus.REVOKED, "trust_level": 0})
+            self._remote_agents[ara_id] = revoked
+            for lease in tuple(self._leases.values()):
+                if lease.tenant_id == tenant_id and lease.ara_id == ara_id:
+                    self._leases[lease.task_id] = lease.model_copy(
+                        update={"expires_at": datetime.now(UTC)}
+                    )
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.ARA_REVOKED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"ara_id": str(ara_id)},
+                )
+            )
+            return revoked
 
     async def get_artifact(self, tenant_id: UUID, artifact_id: UUID) -> Artifact | None:
         async with self._lock:

@@ -239,11 +239,33 @@ export MARIADB_ROOT_PASSWORD='your-local-database-password'
 export ASTRA_TRUSTED_PROXY_SECRET='generate-a-long-random-value'
 export ASTRA_TENANT_ID='00000000-0000-0000-0000-000000000001'
 export ASTRA_ARA_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+export ASTRA_DOCKER_SOCKET="$(docker context inspect --format '{{.Endpoints.docker.Host}}' | sed 's|^unix://||')"
+export ASTRA_SANDBOX_WORKSPACE_ROOT="$HOME/Downloads"
 sh deploy/generate-astra-dev-certs.sh "$ASTRA_TENANT_ID" "$ASTRA_ARA_ID"
 docker compose -f compose.yaml -f compose.secure.yaml up -d --build
 ```
 
+The secure local stack enables `run_command` for its development tenant. It runs only after a
+user approval and creates a short-lived `debian:bookworm-slim` sandbox with no network, a
+read-only root filesystem, a read-only `/workspace` mount, limited CPU/memory/PIDs, and bounded
+output. The model supplies only argv; the controller supplies the image, mount, and limits.
+
+`ASTRA_SANDBOX_WORKSPACE_ROOT` must be an existing host directory shared with Docker Desktop. It
+is mounted at the same absolute path in the controller, allowing the Docker daemon to mount that
+exact directory read-only into each sandbox. It must not be the repository root or another broad
+host directory.
+
+`ASTRA_DOCKER_SOCKET` must be the absolute host path to the active Docker Unix socket. Docker
+Desktop commonly uses the path returned by the command above. This mount lets the controller
+create sandbox containers and is powerful host-level access; it is appropriate only for this
+local development stack. Production deployments should use a dedicated rootless or remote
+container runtime endpoint with narrowly scoped access rather than a host Docker socket.
+
 ### Connect to running secure stack
+
+The operator console is available at `http://localhost:3000`. See
+[`docs/operator-console.md`](docs/operator-console.md) for startup, the local development token,
+operator roles, and each console workstream.
 
 The simplest development connection uses the bundled local login:
 

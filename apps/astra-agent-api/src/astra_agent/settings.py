@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     oidc_jwks_url: str | None = None
     oidc_tenant_claim: str = "tenant_id"
     oidc_jwks_cache_seconds: int = Field(default=300, ge=30, le=86_400)
+    console_origins: tuple[str, ...] = ()
     artifact_bucket: str | None = None
     artifact_endpoint_url: str | None = None
     artifact_access_key: str | None = None

@@ -2,6 +2,13 @@
   "realm": "astra-agent",
   "enabled": true,
   "sslRequired": "NONE",
+  "roles": {
+    "realm": [
+      {"name": "platform_operator", "description": "Astra platform operator"},
+      {"name": "tenant_admin", "description": "Astra tenant administrator"},
+      {"name": "auditor", "description": "Astra read-only auditor"}
+    ]
+  },
   "clients": [
     {
       "clientId": "astra-tui",
@@ -45,7 +52,8 @@
       "lastName": "Developer",
       "requiredActions": [],
       "credentials": [{"type": "password", "value": "development-only", "temporary": false}],
-      "attributes": {"tenant_id": ["00000000-0000-0000-0000-000000000001"]}
+      "attributes": {"tenant_id": ["00000000-0000-0000-0000-000000000001"]},
+      "realmRoles": ["platform_operator"]
     }
   ]
 }

@@ -1,5 +1,7 @@
 .env
 .venv/
+apps/astra-console/.next/
+apps/astra-console/node_modules/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
