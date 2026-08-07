@@ -1334,6 +1334,9 @@ class InMemoryRuntimeStore:
             if remote_agent is None or remote_agent.tenant_id != tenant_id:
                 return None
             now = datetime.now(expires_at.tzinfo)
+            # Keep ARA active on lease polls
+            if remote_agent is not None:
+                self._remote_agents[ara_id] = remote_agent.model_copy(update={"last_seen_at": now})
             expired_task_ids = {
                 lease.task_id for lease in self._leases.values() if lease.expires_at <= now
             }
