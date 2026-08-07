@@ -2404,6 +2404,8 @@ class MariaDBRuntimeStore:
             remote_agent = await session.get(RemoteAgentRow, str(ara_id))
             if remote_agent is None or remote_agent.tenant_id != str(tenant_id):
                 return None
+            # Keep ARA active on lease polls
+            remote_agent.last_seen_at = _naive_utc(datetime.now(UTC))
             if remote_agent.status is not RemoteAgentStatus.ACTIVE or remote_agent.trust_level <= 0:
                 return None
             if _naive_utc(datetime.now(UTC)) - remote_agent.last_seen_at > timedelta(minutes=2):
