@@ -865,7 +865,7 @@ def create_app(
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
         request: Request,
     ) -> TaskLifecycleResponse:
-        return await finish(
+        result = await finish(
             body,
             principal,
             runtime_store,
@@ -873,6 +873,8 @@ def create_app(
             body.result,
             request.app.state.artifact_store,
         )
+        request.app.state.advance_turn(body.tenant_id)
+        return result
 
     @ara_api.post("/cancel", response_model=TaskLifecycleResponse)
     async def cancel_task(
@@ -892,9 +894,11 @@ def create_app(
         runtime_store: Annotated[RuntimeStore, Depends(_store)],
         request: Request,
     ) -> TaskLifecycleResponse:
-        return await finish(
+        result = await finish(
             body, principal, runtime_store, TaskState.FAILED, body.error, request=request
         )
+        request.app.state.advance_turn(body.tenant_id)
+        return result
 
     @ara_api.post("/approvals", response_model=ApprovalResponse, status_code=201)
     async def request_approval(
