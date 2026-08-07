@@ -163,6 +163,30 @@ both `ASTRA_SANDBOX_EXECUTABLE` to an absolute `docker` or `podman` executable a
 `ASTRA_SANDBOX_IMAGE` to the approved image. Commands run with no network, a read-only workspace,
 resource limits, and an approval gate unless policy pre-authorizes the capability.
 
+### Privileged Host ARA
+
+`astra-host-ara` is a separately installed ARA for deliberately granting the controller command
+execution on its host. It never grants the controller process host access directly. It registers
+only `command.execute:host`, receives leased `delegate_host_command` tasks, executes direct argv
+without shell parsing, and returns bounded output with an exit status.
+
+It is disabled unless all required identity and opt-in settings are present. Its execution policy is
+enforced on the host, not trusted to the controller: `approval_required` rejects autonomous tasks,
+`autonomous_allowlist` permits only configured absolute executables and optional working-directory
+roots, and `unrestricted_autonomous` permits arbitrary direct argv only after an additional explicit
+confirmation.
+
+```dotenv
+ASTRA_HOST_ARA_ENABLED=true
+ASTRA_HOST_ARA_TENANT_ID=YOUR_TENANT_UUID
+ASTRA_HOST_ARA_ID=YOUR_HOST_ARA_UUID
+ASTRA_HOST_ARA_EXECUTION_MODE=unrestricted_autonomous
+ASTRA_HOST_ARA_CONFIRM_UNRESTRICTED_AUTONOMY=true
+```
+
+Run `uv run astra-host-ara` on the intended host. This is unrestricted command authority for the
+registered tenant's controller; retain audit logs and stop the process to revoke availability.
+
 ## Memory
 
 ### Hermes Holographic import

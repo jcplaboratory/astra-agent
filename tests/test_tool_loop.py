@@ -350,6 +350,63 @@ async def test_delegate_ara_reports_when_no_eligible_agent_is_connected() -> Non
     assert all(tool.name != "delegate_ara" for tool in provider.tools[0])
 
 
+async def test_delegate_host_command_creates_a_capability_scoped_task() -> None:
+    tenant_id, user_id, ara_id = uuid4(), uuid4(), uuid4()
+    provider = ScriptedProvider(
+        (
+            ModelCompletion(
+                tool_calls=(
+                    ToolCall(
+                        id="host-1",
+                        name="delegate_host_command",
+                        arguments={
+                            "argv": ["/usr/bin/true"],
+                            "cwd": None,
+                            "reason": "Verify host readiness",
+                        },
+                    ),
+                )
+            ),
+            ModelCompletion(content="Host readiness verified."),
+        )
+    )
+    store = InMemoryRuntimeStore()
+    conversation = await _conversation(store, tenant_id, user_id)
+    await store.register_ara(
+        RemoteAgent(
+            id=ara_id,
+            tenant_id=tenant_id,
+            name="host",
+            capabilities=(Capability(kind=CapabilityKind.COMMAND_EXECUTE_HOST, scope="host"),),
+            runtime_version="test",
+        ),
+        AuditEvent(
+            tenant_id=tenant_id,
+            event_type=EventType.ARA_REGISTERED,
+            actor_type=ActorType.ARA,
+            actor_id=ara_id,
+        ),
+    )
+    orchestrator = ConversationOrchestrator(
+        store,
+        BoundedContextCompiler("safe persona"),
+        provider,
+        12,
+        tool_registry=LocalToolRegistry(Settings(tenant_workspaces={})),
+    )
+    await orchestrator.start_turn(tenant_id, user_id, conversation.id, uuid4(), "Check the host")
+
+    paused = await orchestrator.advance_one(tenant_id)
+
+    assert paused is not None and paused.state is ConversationTurnState.PAUSED
+    assert any(tool.name == "delegate_host_command" for tool in provider.tools[0])
+    task = (await store.list_tasks(tenant_id))[0]
+    assert task.required_capabilities == (
+        Capability(kind=CapabilityKind.COMMAND_EXECUTE_HOST, scope="host"),
+    )
+    assert task.context == '{"argv": ["/usr/bin/true"], "cwd": null}'
+
+
 async def test_planned_siblings_are_distinct_targeted_and_report_partial_failure() -> None:
     tenant_id, user_id = uuid4(), uuid4()
     capability = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
