@@ -525,11 +525,12 @@ class ConversationOrchestrator:
                     "Current availability: A trusted ARA with repository access is connected. "
                     "You may delegate an eligible repository inspection."
                     if has_repository_ara
-                    else (
-                        "Current availability: No trusted ARA with repository access is connected. "
-                        "Do not claim that you can start a remote inspection now. Explain that an "
-                        "must connect first."
-                    )
+                    else "No repository ARA is connected."
+                )
+                + (
+                    " A host command ARA is available for executing approved host commands."
+                    if await self._has_available_host_ara(turn.tenant_id)
+                    else ""
                 )
             )
         await self._store.append_event(
