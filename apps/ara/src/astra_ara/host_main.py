@@ -47,10 +47,6 @@ async def serve(settings: HostARASettings) -> None:
             if leased is None:
                 if settings.once:
                     return
-                await client.heartbeat(HeartbeatRequest(
-                    tenant_id=settings.tenant_id,
-                    ara_id=settings.ara_id,
-                ))
                 await asyncio.sleep(settings.poll_seconds)
                 continue
             bound = {
