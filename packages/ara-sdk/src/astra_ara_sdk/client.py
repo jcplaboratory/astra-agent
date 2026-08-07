@@ -54,16 +54,19 @@ class ARAClient:
         response.raise_for_status()
 
     async def lease(self, duration_seconds: int = 60) -> LeaseResponse | None:
-        request = LeaseRequest(
-            tenant_id=self.tenant_id,
-            ara_id=self.ara_id,
-            duration_seconds=duration_seconds,
-        )
-        response = await self._post("/api/v1/aras/lease", request.model_dump(mode="json"))
-        if response.status_code == 204:
+        try:
+            request = LeaseRequest(
+                tenant_id=self.tenant_id,
+                ara_id=self.ara_id,
+                duration_seconds=duration_seconds,
+            )
+            response = await self._post("/api/v1/aras/lease", request.model_dump(mode="json"))
+            if response.status_code == 204:
+                return None
+            response.raise_for_status()
+            return LeaseResponse.model_validate(response.json())
+        except Exception:
             return None
-        response.raise_for_status()
-        return LeaseResponse.model_validate(response.json())
 
     async def progress(self, request: ARAEventRequest) -> None:
         response = await self._post("/api/v1/aras/events", request.model_dump(mode="json"))

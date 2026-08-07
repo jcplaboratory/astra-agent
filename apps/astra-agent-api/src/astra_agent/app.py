@@ -852,11 +852,12 @@ def create_app(
                 detail,
                 artifacts,
             )
-            if request is not None:
-                request.app.state.advance_turn(body.tenant_id)
             return TaskLifecycleResponse(task_id=task.id, state=task.state)
         except (LifecycleNotFoundError, LifecycleConflictError) as error:
             raise_lifecycle_error(error)
+        finally:
+            if request is not None:
+                request.app.state.advance_turn(body.tenant_id)
 
     @ara_api.post("/complete", response_model=TaskLifecycleResponse)
     async def complete_task(
