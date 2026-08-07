@@ -39,6 +39,38 @@ class MaliciousVectorIndex(NullVectorIndex):
         return (self.returned_id,)
 
 
+async def test_pinned_promoted_memory_precedes_ranked_recall() -> None:
+    tenant_id = uuid4()
+    store = InMemoryRuntimeStore()
+    pinned = MemoryRecord(
+        tenant_id=tenant_id,
+        kind="fact",
+        content="Always use concise answers",
+        normalized_content="always use concise answers",
+        source_event_id=uuid4(),
+        source_message_id=uuid4(),
+        confidence=1,
+        confirmed=True,
+        pinned=True,
+        state=MemoryState.PROMOTED,
+    )
+    relevant = pinned.model_copy(
+        update={
+            "id": uuid4(),
+            "content": "The project is called Aurora",
+            "normalized_content": "the project is called aurora",
+            "pinned": False,
+        }
+    )
+    await store.upsert_memory(pinned, ())
+    await store.upsert_memory(relevant, ())
+
+    compiler = MemoryContextCompiler(store, NullVectorIndex(), "persona", memory_limit=2)
+    briefing = await compiler.compile(tenant_id, "What is the Aurora project?")
+
+    assert briefing.content.index(pinned.content) < briefing.content.index(relevant.content)
+
+
 def _headers(tenant_id: UUID) -> dict[str, str]:
     return {"X-Astra-Tenant-ID": str(tenant_id), "X-Astra-User-ID": str(uuid4())}
 
@@ -306,6 +338,7 @@ async def test_memory_ranking_audit_identifies_lexical_fallback() -> None:
                 "authorized_memory_ids": [],
                 "qdrant_ranked_memory_ids": [str(foreign_id)],
                 "selected_memory_ids": [],
+                "pinned_memory_ids": [],
             },
         )
     ]

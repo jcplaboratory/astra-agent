@@ -288,10 +288,24 @@ class MemoryPipeline:
     async def extract_message(
         self, tenant_id: UUID, source_event_id: UUID, source_message_id: UUID, content: str
     ) -> tuple[MemoryRecord, ...]:
+        return await self.extract_content(
+            tenant_id, source_event_id, source_message_id, content, promote_all=False
+        )
+
+    async def extract_content(
+        self,
+        tenant_id: UUID,
+        source_event_id: UUID,
+        source_message_id: UUID,
+        content: str,
+        *,
+        promote_all: bool,
+    ) -> tuple[MemoryRecord, ...]:
         records: list[MemoryRecord] = []
         for candidate in await self._extractor.extract(content):
             normalized = " ".join(candidate.content.casefold().split())
-            state = MemoryState.PROMOTED if candidate.promoted else MemoryState.CANDIDATE
+            promoted = candidate.promoted or promote_all
+            state = MemoryState.PROMOTED if promoted else MemoryState.CANDIDATE
             memory = MemoryRecord(
                 tenant_id=tenant_id,
                 kind=candidate.kind,
@@ -300,7 +314,7 @@ class MemoryPipeline:
                 source_event_id=source_event_id,
                 source_message_id=source_message_id,
                 confidence=candidate.confidence,
-                confirmed=candidate.promoted,
+                confirmed=promoted,
                 state=state,
             )
             events = [
@@ -314,7 +328,7 @@ class MemoryPipeline:
                     },
                 )
             ]
-            if candidate.promoted:
+            if promoted:
                 events.append(
                     AuditEvent(
                         tenant_id=tenant_id,
@@ -356,43 +370,7 @@ class MemoryContextCompiler:
         self._audit = audit
 
     async def compile(self, tenant_id: UUID, objective: str) -> ContextBriefing:
-        authorized = await self._repository.list_memories(tenant_id, include_candidates=False)
-        by_id = {item.id: item for item in authorized if item.visibility == "private"}
-        qdrant_available = True
-        try:
-            ranked_ids = await self._vector_index.rank(
-                tenant_id,
-                "private",
-                tuple(by_id),
-                deterministic_embedding(objective),
-                self._memory_limit,
-            )
-        except Exception:
-            # Vector availability must not prevent a safe lexical recall.
-            ranked_ids = ()
-            qdrant_available = False
-        # Current vectors are deterministic hashes, not semantic embeddings. Keep Qdrant observable
-        # for migration diagnostics, but use lexical relevance for safe, predictable recall.
-        terms = set(re.findall(r"[a-z0-9_]+", objective.casefold()))
-        ranked = sorted(
-            by_id.values(),
-            key=lambda item: (
-                -len(terms.intersection(re.findall(r"[a-z0-9_]+", item.content.casefold()))),
-                str(item.id),
-            ),
-        )[: self._memory_limit]
-        if self._audit is not None:
-            self._audit(
-                "memory.ranking",
-                {
-                    "objective": objective,
-                    "strategy": "lexical",
-                    "qdrant_available": qdrant_available,
-                    "authorized_memory_ids": [str(item) for item in by_id],
-                    "qdrant_ranked_memory_ids": [str(item) for item in ranked_ids],
-                    "selected_memory_ids": [str(item.id) for item in ranked],
-                },
-            )
+        ranked = await self.recall(tenant_id, objective)
         profile = await self._repository.get_active_persona(tenant_id)
         persona = (
             f"{persona_identity_prefix()}\nPersona guidance: {self._persona_kernel}"
@@ -427,3 +405,46 @@ class MemoryContextCompiler:
             source_memory_ids=included_ids,
             estimated_tokens=(len(content) + 3) // 4,
         )
+
+    async def recall(self, tenant_id: UUID, objective: str) -> tuple[MemoryRecord, ...]:
+        authorized = await self._repository.list_memories(tenant_id, include_candidates=False)
+        by_id = {item.id: item for item in authorized if item.visibility == "private"}
+        qdrant_available = True
+        try:
+            ranked_ids = await self._vector_index.rank(
+                tenant_id,
+                "private",
+                tuple(by_id),
+                deterministic_embedding(objective),
+                self._memory_limit,
+            )
+        except Exception:
+            # Vector availability must not prevent a safe lexical recall.
+            ranked_ids = ()
+            qdrant_available = False
+        # Current vectors are deterministic hashes, not semantic embeddings. Keep Qdrant observable
+        # for migration diagnostics, but use lexical relevance for safe, predictable recall.
+        terms = set(re.findall(r"[a-z0-9_]+", objective.casefold()))
+        ranked = sorted(
+            by_id.values(),
+            key=lambda item: (
+                -len(terms.intersection(re.findall(r"[a-z0-9_]+", item.content.casefold()))),
+                str(item.id),
+            ),
+        )
+        pinned = [item for item in ranked if item.pinned]
+        ranked = (pinned + [item for item in ranked if not item.pinned])[: self._memory_limit]
+        if self._audit is not None:
+            self._audit(
+                "memory.ranking",
+                {
+                    "objective": objective,
+                    "strategy": "lexical",
+                    "qdrant_available": qdrant_available,
+                    "authorized_memory_ids": [str(item) for item in by_id],
+                    "qdrant_ranked_memory_ids": [str(item) for item in ranked_ids],
+                    "selected_memory_ids": [str(item.id) for item in ranked],
+                    "pinned_memory_ids": [str(item.id) for item in pinned],
+                },
+            )
+        return tuple(ranked)

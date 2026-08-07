@@ -40,6 +40,7 @@ from astra_model_providers import (
 from astra_policy import validate_planner_decision
 from astra_runtime import LifecycleConflictError, RuntimeStore
 
+from astra_agent.memory_tools import ControllerMemoryTools
 from astra_agent.settings import Settings
 from astra_agent.tools import LocalToolRegistry, ToolResult
 
@@ -86,6 +87,41 @@ _HOST_COMMAND_TOOL = ToolDefinition(
         "additionalProperties": False,
     },
 )
+_GET_FACT_TOOL = ToolDefinition(
+    name="get_fact",
+    description="Retrieve approved private durable memories relevant to a topic.",
+    parameters={
+        "type": "object",
+        "properties": {"topic": {"type": "string", "minLength": 1}},
+        "required": ["topic"],
+        "additionalProperties": False,
+    },
+)
+_SET_FACT_TOOL = ToolDefinition(
+    name="set_fact",
+    description=(
+        "Extract and automatically promote durable facts from supplied conversation content."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"content": {"type": "string", "minLength": 1}},
+        "required": ["content"],
+        "additionalProperties": False,
+    },
+)
+_SEARCH_SESSION_TOOL = ToolDefinition(
+    name="search_session",
+    description="Search the current user's prior conversations for a query.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+)
 _ARA_SYSTEM_GUIDANCE = (
     "Remote repository capability: You can delegate bounded read-only repository inspection to "
     "a connected Astra Remote Agent (ARA) with delegate_ara. Use it for remote repository "
@@ -109,6 +145,7 @@ class ConversationOrchestrator:
         max_tool_iterations: int = _MAX_TOOL_ITERATIONS,
         max_delegation_siblings: int = 2,
         audit: Callable[[UUID, str, dict[str, Any]], None] | None = None,
+        memory_tools: ControllerMemoryTools | None = None,
     ) -> None:
         self._store = store
         self._compiler = compiler
@@ -120,6 +157,7 @@ class ConversationOrchestrator:
         self._max_tool_iterations = max_tool_iterations
         self._max_delegation_siblings = max_delegation_siblings
         self._audit = audit
+        self._memory_tools = memory_tools
 
     def _record_audit(self, turn: ConversationTurn, stage: str, **payload: Any) -> None:
         if self._audit is not None:
@@ -265,6 +303,8 @@ class ConversationOrchestrator:
                     or turn
                 )
         definitions = self._tool_registry.definitions(turn.tenant_id)
+        if self._memory_tools is not None:
+            definitions = (*definitions, _GET_FACT_TOOL, _SET_FACT_TOOL, _SEARCH_SESSION_TOOL)
         if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
         if await self._has_available_host_ara(turn.tenant_id):
@@ -370,6 +410,8 @@ class ConversationOrchestrator:
     ) -> AsyncIterator[ModelStreamEvent]:
         messages, iterations, _ = await self._messages_for_turn(turn)
         definitions = self._tool_registry.definitions(turn.tenant_id)
+        if self._memory_tools is not None:
+            definitions = (*definitions, _GET_FACT_TOOL, _SET_FACT_TOOL, _SEARCH_SESSION_TOOL)
         if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
         if await self._has_available_host_ara(turn.tenant_id):
@@ -526,6 +568,8 @@ class ConversationOrchestrator:
             return await self._delegate_ara(turn, run_lease_id, call, messages)
         if call.name == _HOST_COMMAND_TOOL.name and call.name in known_tools:
             return await self._delegate_host_command(turn, run_lease_id, call, messages)
+        if call.name in {_GET_FACT_TOOL.name, _SET_FACT_TOOL.name, _SEARCH_SESSION_TOOL.name}:
+            return await self._execute_memory_tool(turn, call, messages)
         invocation_id = uuid4()
         invocation = await self._store.create_tool_invocation(
             ToolInvocation(
@@ -572,6 +616,59 @@ class ConversationOrchestrator:
             await self._store.fail_tool_invocation(turn.tenant_id, invocation.id)
             tool_content = "The tool request was denied or could not be completed."
         messages.append(self._tool_message(call.name, tool_content))
+        return None
+
+    async def _execute_memory_tool(
+        self, turn: ConversationTurn, call: ToolCall, messages: list[ModelMessage]
+    ) -> ConversationTurn | None:
+        if self._memory_tools is None:
+            messages.append(self._tool_message(call.name, "Memory tools are unavailable."))
+            return None
+        invocation = await self._store.create_tool_invocation(
+            ToolInvocation(
+                tenant_id=turn.tenant_id,
+                turn_id=turn.id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                target=ToolInvocationTarget.LOCAL,
+                arguments=call.arguments,
+                arguments_sha256=self._arguments_sha256(call.arguments),
+            )
+        )
+        try:
+            if call.name == _GET_FACT_TOOL.name:
+                topic = call.arguments.get("topic")
+                if not isinstance(topic, str) or not topic:
+                    raise ValueError("topic must be a non-empty string")
+                result = await self._memory_tools.get_fact(turn.tenant_id, topic)
+            elif call.name == _SET_FACT_TOOL.name:
+                content = call.arguments.get("content")
+                if not isinstance(content, str) or not content:
+                    raise ValueError("content must be a non-empty string")
+                result = await self._memory_tools.set_fact(
+                    turn.tenant_id, turn.user_message_id, content
+                )
+            else:
+                query = call.arguments.get("query")
+                limit = call.arguments.get("limit", 8)
+                if not isinstance(query, str) or not query or not isinstance(limit, int):
+                    raise ValueError("query and limit are invalid")
+                conversation = await self._store.get_conversation(
+                    turn.tenant_id, turn.conversation_id
+                )
+                if conversation is None:
+                    raise LifecycleConflictError("conversation is unavailable")
+                result = await self._memory_tools.search_session(
+                    turn.tenant_id, conversation.user_id, query, min(max(limit, 1), 20)
+                )
+        except (ValueError, LifecycleConflictError):
+            await self._store.fail_tool_invocation(turn.tenant_id, invocation.id)
+            messages.append(
+                self._tool_message(call.name, "Memory tool request could not be completed.")
+            )
+            return None
+        await self._store.complete_tool_invocation(turn.tenant_id, invocation.id)
+        messages.append(self._tool_message(call.name, result[:_MAX_TOOL_RESULT_CHARS]))
         return None
 
     async def _delegate_ara(

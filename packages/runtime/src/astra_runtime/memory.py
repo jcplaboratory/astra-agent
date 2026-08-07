@@ -628,6 +628,31 @@ class InMemoryRuntimeStore:
                 )
             return reviewed
 
+    async def pin_memory(
+        self, tenant_id: UUID, memory_id: UUID, pinned: bool, actor_id: UUID
+    ) -> MemoryRecord:
+        async with self._lock:
+            memory = self._memories.get(memory_id)
+            if (
+                memory is None
+                or memory.tenant_id != tenant_id
+                or memory.state is not MemoryState.PROMOTED
+            ):
+                raise LifecycleNotFoundError("promoted memory not found")
+            now = datetime.now(UTC)
+            updated = memory.model_copy(update={"pinned": pinned, "updated_at": now})
+            self._memories[memory_id] = updated
+            self._events.append(
+                AuditEvent(
+                    tenant_id=tenant_id,
+                    event_type=EventType.MEMORY_PINNED if pinned else EventType.MEMORY_UNPINNED,
+                    actor_type=ActorType.USER,
+                    actor_id=actor_id,
+                    payload={"memory_id": str(memory_id)},
+                )
+            )
+            return updated
+
     async def create_conversation(
         self, conversation: Conversation, event: AuditEvent
     ) -> Conversation:
