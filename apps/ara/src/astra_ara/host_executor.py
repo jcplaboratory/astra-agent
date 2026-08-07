@@ -1,10 +1,21 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
 from astra_domain import Task
 
 from astra_ara.settings import HostARASettings
+
+
+def _which(name: str) -> Path | None:
+    """Search PATH for an executable, returning its resolved Path."""
+    path = os.environ.get("PATH", "/usr/bin:/bin")
+    for directory in path.split(os.pathsep):
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.resolve()
+    return None
 
 
 class HostCommandExecutor:
@@ -27,7 +38,14 @@ class HostCommandExecutor:
             or (cwd is not None and not isinstance(cwd, str))
         ):
             raise ValueError("host command task has invalid argv or cwd")
-        executable = Path(argv[0]).expanduser().resolve(strict=True)
+        executable = Path(argv[0]).expanduser()
+        if not executable.is_absolute():
+            resolved = _which(executable.name)
+            if resolved is None:
+                raise FileNotFoundError(f"command not found: {argv[0]}")
+            executable = resolved
+        else:
+            executable = executable.resolve(strict=True)
         working_directory = Path(cwd).expanduser().resolve(strict=True) if cwd else None
         self._authorize(executable, working_directory)
         try:
