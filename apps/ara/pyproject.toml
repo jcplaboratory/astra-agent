@@ -6,6 +6,7 @@ dependencies = ["ara-sdk", "astra-domain", "astra-protocol", "httpx>=0.28", "pyd
 
 [project.scripts]
 ara = "astra_ara.main:run"
+astra-host-ara = "astra_ara.host_main:run"
 
 [tool.uv.sources]
 ara-sdk = { workspace = true }

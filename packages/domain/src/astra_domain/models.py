@@ -24,6 +24,7 @@ class CapabilityKind(StrEnum):
     FILE_READ = "file.read"
     FILE_WRITE = "file.write"
     COMMAND_EXECUTE = "command.execute"
+    COMMAND_EXECUTE_HOST = "command.execute:host"
     NETWORK_ACCESS = "network.access"
     CREDENTIAL_ACCESS = "credential.access"
     EXTERNAL_MESSAGE = "external.message"

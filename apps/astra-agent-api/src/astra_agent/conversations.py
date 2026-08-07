@@ -49,6 +49,7 @@ _MAX_TOOL_RESULT_CHARS = 12_000
 _FILE_READ_CAPABILITY = Capability(kind=CapabilityKind.FILE_READ, scope="workspace")
 _ARA_FILE_READ_CAPABILITY = Capability(kind=CapabilityKind.FILE_READ, scope="repository")
 _COMMAND_CAPABILITY = Capability(kind=CapabilityKind.COMMAND_EXECUTE, scope="workspace")
+_HOST_COMMAND_CAPABILITY = Capability(kind=CapabilityKind.COMMAND_EXECUTE_HOST, scope="host")
 _ARA_DELEGATE_TOOL = ToolDefinition(
     name="delegate_ara",
     description=(
@@ -64,6 +65,24 @@ _ARA_DELEGATE_TOOL = ToolDefinition(
             "context": {"type": "string"},
         },
         "required": ["objective"],
+        "additionalProperties": False,
+    },
+)
+_HOST_COMMAND_TOOL = ToolDefinition(
+    name="delegate_host_command",
+    description=(
+        "Run a direct argv command on a separately registered privileged Host ARA. Use only when "
+        "the user has explicitly authorized host automation. The Host ARA independently enforces "
+        "its configured approval, allowlist, or unrestricted autonomy policy."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "cwd": {"type": ["string", "null"]},
+            "reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["argv", "reason"],
         "additionalProperties": False,
     },
 )
@@ -248,6 +267,8 @@ class ConversationOrchestrator:
         definitions = self._tool_registry.definitions(turn.tenant_id)
         if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
+        if await self._has_available_host_ara(turn.tenant_id):
+            definitions = (*definitions, _HOST_COMMAND_TOOL)
         known_tools = {definition.name for definition in definitions}
 
         while pending_calls:
@@ -351,6 +372,8 @@ class ConversationOrchestrator:
         definitions = self._tool_registry.definitions(turn.tenant_id)
         if self._delegation_enabled and await self._has_available_ara(turn.tenant_id):
             definitions = (*definitions, _ARA_DELEGATE_TOOL)
+        if await self._has_available_host_ara(turn.tenant_id):
+            definitions = (*definitions, _HOST_COMMAND_TOOL)
         streamer = getattr(self._model_provider, "stream", None)
         if not callable(streamer):
             raise ModelProviderError("model provider does not support streaming")
@@ -501,6 +524,8 @@ class ConversationOrchestrator:
     ) -> ConversationTurn | None:
         if call.name == _ARA_DELEGATE_TOOL.name and call.name in known_tools:
             return await self._delegate_ara(turn, run_lease_id, call, messages)
+        if call.name == _HOST_COMMAND_TOOL.name and call.name in known_tools:
+            return await self._delegate_host_command(turn, run_lease_id, call, messages)
         invocation_id = uuid4()
         invocation = await self._store.create_tool_invocation(
             ToolInvocation(
@@ -615,6 +640,77 @@ class ConversationOrchestrator:
                 arguments_sha256=self._arguments_sha256(call.arguments),
             )
         )
+        return await self._store.pause_turn(
+            turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
+        )
+
+    async def _delegate_host_command(
+        self,
+        turn: ConversationTurn,
+        run_lease_id: UUID,
+        call: ToolCall,
+        messages: list[ModelMessage],
+    ) -> ConversationTurn | None:
+        argv = call.arguments.get("argv")
+        cwd = call.arguments.get("cwd")
+        reason = call.arguments.get("reason")
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(isinstance(item, str) and item for item in argv)
+            or (cwd is not None and not isinstance(cwd, str))
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            messages.append(self._tool_message(call.name, "Invalid host command arguments."))
+            return None
+        existing = await self._store.get_tool_invocation(turn.tenant_id, turn.id, call.id)
+        if existing is not None:
+            if existing.task_id is None:
+                raise LifecycleConflictError("host command invocation has no task")
+            task = await self._store.get_task(turn.tenant_id, existing.task_id)
+            if task is None:
+                raise LifecycleConflictError("host command task is unavailable")
+            if task.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+                messages.append(self._tool_message(call.name, self._bounded_task_result(task)))
+                return None
+            return await self._store.pause_turn(
+                turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
+            )
+        if not await self._has_available_host_ara(turn.tenant_id):
+            messages.append(
+                self._tool_message(call.name, "No active privileged Host ARA is available.")
+            )
+            return None
+        task = Task(
+            tenant_id=turn.tenant_id,
+            objective=reason[:10_000],
+            context=json.dumps({"argv": argv, "cwd": cwd}, ensure_ascii=True),
+            required_capabilities=(_HOST_COMMAND_CAPABILITY,),
+            deliverable_contract="Return bounded host command exit status and output.",
+        )
+        await self._store.add_task(
+            task,
+            AuditEvent(
+                tenant_id=turn.tenant_id,
+                event_type=EventType.TASK_CREATED,
+                actor_type=ActorType.COORDINATOR,
+                task_id=task.id,
+                payload={"turn_id": str(turn.id), "host_command": True, "argv": argv, "cwd": cwd},
+            ),
+        )
+        await self._store.create_tool_invocation(
+            ToolInvocation(
+                tenant_id=turn.tenant_id,
+                turn_id=turn.id,
+                task_id=task.id,
+                tool_call_id=call.id,
+                tool_name=call.name,
+                target=ToolInvocationTarget.ARA,
+                arguments=call.arguments,
+                arguments_sha256=self._arguments_sha256(call.arguments),
+            )
+        )
         return await self._store.pause_turn(turn.tenant_id, turn.id, run_lease_id, turn.checkpoint)
 
     async def _has_available_ara(self, tenant_id: UUID) -> bool:
@@ -622,6 +718,14 @@ class ConversationOrchestrator:
             ara.status is RemoteAgentStatus.ACTIVE
             and ara.trust_level > 0
             and _ARA_FILE_READ_CAPABILITY in ara.capabilities
+            for ara in await self._store.list_remote_agents(tenant_id)
+        )
+
+    async def _has_available_host_ara(self, tenant_id: UUID) -> bool:
+        return any(
+            ara.status is RemoteAgentStatus.ACTIVE
+            and ara.trust_level > 0
+            and _HOST_COMMAND_CAPABILITY in ara.capabilities
             for ara in await self._store.list_remote_agents(tenant_id)
         )
 
