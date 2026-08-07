@@ -1460,9 +1460,20 @@ class InMemoryRuntimeStore:
                     for approval in self._approvals.values()
                     if approval.task_id == task_id and approval.state is ApprovalState.GRANTED
                 )
+                # Also check coordinator approvals linked via tool invocations
+                coordinator_approvals = tuple(
+                    approval
+                    for inv in self._tool_invocations.values()
+                    if inv.tenant_id == tenant_id and inv.task_id == task_id
+                    for approval in self._approvals.values()
+                    if approval.tool_invocation_id == inv.id
+                    and approval.state is ApprovalState.GRANTED
+                )
+                all_approvals = approvals + coordinator_approvals
                 for capability in task.required_capabilities:
                     approval_state = next(
-                        (item.state for item in approvals if item.capability == capability), None
+                        (item.state for item in all_approvals if item.capability == capability),
+                        None,
                     )
                     decision = evaluate_capability(
                         capability, task.required_capabilities, approval_state

@@ -763,49 +763,82 @@ class ConversationOrchestrator:
             return None
         existing = await self._store.get_tool_invocation(turn.tenant_id, turn.id, call.id)
         if existing is not None:
-            if existing.task_id is None:
-                raise LifecycleConflictError("host command invocation has no task")
-            task = await self._store.get_task(turn.tenant_id, existing.task_id)
-            if task is None:
-                raise LifecycleConflictError("host command task is unavailable")
-            if task.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
-                messages.append(self._tool_message(call.name, self._bounded_task_result(task)))
+            if existing.state == ToolInvocationState.AWAITING_APPROVAL:
+                return await self._store.pause_turn(
+                    turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
+                )
+            if existing.state == ToolInvocationState.DENIED:
+                messages.append(self._tool_message(call.name, "Host command denied by operator."))
                 return None
-            return await self._store.pause_turn(
-                turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
-            )
+            if existing.state in {ToolInvocationState.PENDING, ToolInvocationState.COMPLETED}:
+                if existing.task_id is not None:
+                    task = await self._store.get_task(turn.tenant_id, existing.task_id)
+                    if task is not None:
+                        if task.state in {TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED}:
+                            messages.append(self._tool_message(call.name, self._bounded_task_result(task)))
+                            return None
+                        return await self._store.pause_turn(
+                            turn.tenant_id, turn.id, run_lease_id, turn.checkpoint
+                        )
+                # Approved but no task yet — create it now
+                if not await self._has_available_host_ara(turn.tenant_id):
+                    messages.append(self._tool_message(call.name, "No active Host ARA available."))
+                    return None
+                task = Task(
+                    tenant_id=turn.tenant_id,
+                    objective=reason[:10_000],
+                    context=json.dumps({"argv": argv, "cwd": cwd}, ensure_ascii=True),
+                    required_capabilities=(_HOST_COMMAND_CAPABILITY,),
+                    deliverable_contract="Return bounded host command exit status and output.",
+                )
+                await self._store.add_task(
+                    task,
+                    AuditEvent(
+                        tenant_id=turn.tenant_id,
+                        event_type=EventType.TASK_CREATED,
+                        actor_type=ActorType.COORDINATOR,
+                        task_id=task.id,
+                        payload={"turn_id": str(turn.id), "host_command": True, "argv": argv, "cwd": cwd},
+                    ),
+                )
+                await self._store.complete_tool_invocation(turn.tenant_id, existing.id)
+                # Create new invocation linked to the task
+                new_inv = ToolInvocation(
+                    tenant_id=turn.tenant_id,
+                    turn_id=turn.id,
+                    task_id=task.id,
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    target=ToolInvocationTarget.ARA,
+                    arguments=call.arguments,
+                    arguments_sha256=self._arguments_sha256(call.arguments),
+                )
+                await self._store.create_tool_invocation(new_inv)
+                return await self._store.pause_turn(turn.tenant_id, turn.id, run_lease_id, turn.checkpoint)
+            return None
         if not await self._has_available_host_ara(turn.tenant_id):
             messages.append(
                 self._tool_message(call.name, "No active privileged Host ARA is available.")
             )
             return None
-        task = Task(
+        # Create tool invocation and approval — NOT the task yet
+        invocation = ToolInvocation(
             tenant_id=turn.tenant_id,
-            objective=reason[:10_000],
-            context=json.dumps({"argv": argv, "cwd": cwd}, ensure_ascii=True),
-            required_capabilities=(_HOST_COMMAND_CAPABILITY,),
-            deliverable_contract="Return bounded host command exit status and output.",
+            turn_id=turn.id,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            target=ToolInvocationTarget.ARA,
+            arguments=call.arguments,
+            arguments_sha256=self._arguments_sha256(call.arguments),
         )
-        await self._store.add_task(
-            task,
-            AuditEvent(
+        await self._store.create_tool_invocation(invocation)
+        await self._store.create_coordinator_approval(
+            Approval(
                 tenant_id=turn.tenant_id,
-                event_type=EventType.TASK_CREATED,
-                actor_type=ActorType.COORDINATOR,
-                task_id=task.id,
-                payload={"turn_id": str(turn.id), "host_command": True, "argv": argv, "cwd": cwd},
-            ),
-        )
-        await self._store.create_tool_invocation(
-            ToolInvocation(
-                tenant_id=turn.tenant_id,
-                turn_id=turn.id,
-                task_id=task.id,
-                tool_call_id=call.id,
-                tool_name=call.name,
-                target=ToolInvocationTarget.ARA,
-                arguments=call.arguments,
-                arguments_sha256=self._arguments_sha256(call.arguments),
+                tool_invocation_id=invocation.id,
+                capability=_HOST_COMMAND_CAPABILITY,
+                requestor_type=ActorType.COORDINATOR,
+                reason=f"Host command: {reason[:200]}",
             )
         )
         return await self._store.pause_turn(turn.tenant_id, turn.id, run_lease_id, turn.checkpoint)
