@@ -160,6 +160,7 @@ class MemoryRecordRow(Base):
     )
     confidence: Mapped[float] = mapped_column(Float)
     confirmed: Mapped[bool] = mapped_column(Boolean)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
     state: Mapped[MemoryState] = mapped_column(Enum(MemoryState), index=True)
     sensitivity: Mapped[str] = mapped_column(String(100))
     visibility: Mapped[str] = mapped_column(String(100))
@@ -454,6 +455,7 @@ def _memory_row(memory: MemoryRecord) -> MemoryRecordRow:
         source_message_id=str(memory.source_message_id),
         confidence=memory.confidence,
         confirmed=memory.confirmed,
+        pinned=memory.pinned,
         state=memory.state,
         sensitivity=memory.sensitivity,
         visibility=memory.visibility,
@@ -690,6 +692,7 @@ def _memory(row: MemoryRecordRow) -> MemoryRecord:
         source_message_id=UUID(row.source_message_id),
         confidence=row.confidence,
         confirmed=row.confirmed,
+        pinned=row.pinned,
         state=row.state,
         sensitivity=row.sensitivity,
         visibility=row.visibility,
@@ -1466,6 +1469,36 @@ class MariaDBRuntimeStore:
                     AuditEvent(
                         tenant_id=tenant_id,
                         event_type=EventType.MEMORY_DELETED,
+                        actor_type=ActorType.USER,
+                        actor_id=actor_id,
+                        payload={"memory_id": str(memory_id)},
+                    )
+                )
+            )
+            return _memory(row)
+
+    async def pin_memory(
+        self, tenant_id: UUID, memory_id: UUID, pinned: bool, actor_id: UUID
+    ) -> MemoryRecord:
+        async with self._sessions.begin() as session:
+            row = await session.scalar(
+                select(MemoryRecordRow)
+                .where(
+                    MemoryRecordRow.id == str(memory_id),
+                    MemoryRecordRow.tenant_id == str(tenant_id),
+                    MemoryRecordRow.state == MemoryState.PROMOTED,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                raise LifecycleNotFoundError("promoted memory not found")
+            row.pinned = pinned
+            row.updated_at = _naive_utc(datetime.now(UTC))
+            session.add(
+                _event_row(
+                    AuditEvent(
+                        tenant_id=tenant_id,
+                        event_type=EventType.MEMORY_PINNED if pinned else EventType.MEMORY_UNPINNED,
                         actor_type=ActorType.USER,
                         actor_id=actor_id,
                         payload={"memory_id": str(memory_id)},

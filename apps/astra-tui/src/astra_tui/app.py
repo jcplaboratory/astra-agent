@@ -57,11 +57,13 @@ class AstraAgentApp(App[None]):
     #memories .title { color: #a78bfa; }
     #memory-actions { height: 1; margin-top: 1; }
     #memory-actions.hidden { display: none; }
-    #promote-memory, #reject-memory {
+    #promote-memory, #reject-memory, #pin-memory {
         width: 1fr; min-width: 0; margin: 0 1 0 0;
         color: #eeeeee; background: #1e1e1e; border: none;
     }
-    #promote-memory:focus, #reject-memory:focus { background: #fab283; color: #141414; }
+    #promote-memory:focus, #reject-memory:focus, #pin-memory:focus {
+        background: #fab283; color: #141414;
+    }
     #message-input {
         dock: bottom; margin: 0 2 1 2; height: 3;
         border: round #334155; background: #0f172a;
@@ -91,6 +93,7 @@ class AstraAgentApp(App[None]):
         self.pending_approval_id: str | None = None
         self.conversation_id: str | None = None
         self.candidate_memory_id: str | None = None
+        self.promoted_memory_id: str | None = None
         self.active_turn_id: str | None = None
         self.active_turn_paused = False
         self.latest_artifact_id: str | None = None
@@ -132,6 +135,7 @@ class AstraAgentApp(App[None]):
                 with Horizontal(id="memory-actions", classes="hidden"):
                     yield Button("Promote", id="promote-memory", disabled=True)
                     yield Button("Reject", id="reject-memory", disabled=True)
+                    yield Button("Pin", id="pin-memory", disabled=True)
             with Vertical(id="jobs", classes="panel"):
                 yield Label("ISSUES", classes="title")
                 yield Static("No failed jobs", id="job-list")
@@ -294,6 +298,8 @@ class AstraAgentApp(App[None]):
             artifacts = artifacts_response.json()
             candidates = [item for item in memories if item["state"] == "candidate"]
             self.candidate_memory_id = candidates[0]["id"] if candidates else None
+            promoted = [item for item in memories if item["state"] == "promoted"]
+            self.promoted_memory_id = promoted[-1]["id"] if promoted else None
             task_lines = [
                 f"{item['state']:>9}  {item['objective']}"
                 + (f" [{item['target_ara_id'][:8]}]" if item.get("target_ara_id") else "")
@@ -315,7 +321,10 @@ class AstraAgentApp(App[None]):
             else:
                 text = "No pending approvals"
             self.query_one("#approval-list", Static).update(text)
-            memory_lines = [f"{item['state']:>9}  {item['content']}" for item in memories[-5:]]
+            memory_lines = [
+                f"{'pinned' if item['pinned'] else item['state']:>9}  {item['content']}"
+                for item in memories[-5:]
+            ]
             self.query_one("#memory-list", Static).update(
                 "\n".join(memory_lines) or "No approved memory"
             )
@@ -342,6 +351,9 @@ class AstraAgentApp(App[None]):
             can_review = bool(self.candidate_memory_id and (self.user_id or self.access_token))
             self.query_one("#promote-memory", Button).disabled = not can_review
             self.query_one("#reject-memory", Button).disabled = not can_review
+            self.query_one("#pin-memory", Button).disabled = not bool(
+                self.promoted_memory_id and (self.user_id or self.access_token)
+            )
             self.query_one("#memory-actions", Horizontal).set_class(
                 not can_review, "hidden"
             )
@@ -393,6 +405,9 @@ class AstraAgentApp(App[None]):
         if event.button.id in {"promote-memory", "reject-memory"}:
             await self._review_memory(event.button.id == "promote-memory")
             return
+        if event.button.id == "pin-memory":
+            await self._pin_memory()
+            return
         if event.button.id not in {"grant", "deny", "grant-inline", "deny-inline"}:
             return
         if not self.pending_approval_id or not self.tenant_id:
@@ -424,6 +439,22 @@ class AstraAgentApp(App[None]):
                 response = await client.post(
                     f"/api/v1/memories/{self.candidate_memory_id}/review",
                     json={"tenant_id": self.tenant_id, "promote": promote},
+                )
+                response.raise_for_status()
+            await self.refresh_activity()
+        except httpx.HTTPError:
+            return
+
+    async def _pin_memory(self) -> None:
+        if not self.promoted_memory_id or not self.tenant_id:
+            return
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url, timeout=3, headers=self._user_headers()
+            ) as client:
+                response = await client.post(
+                    f"/api/v1/memories/{self.promoted_memory_id}/pin",
+                    json={"tenant_id": self.tenant_id, "pinned": True},
                 )
                 response.raise_for_status()
             await self.refresh_activity()

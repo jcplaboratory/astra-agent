@@ -105,6 +105,10 @@ class RuntimeStore(Protocol):
         replaces_memory_id: UUID | None = None,
     ) -> MemoryRecord: ...
 
+    async def pin_memory(
+        self, tenant_id: UUID, memory_id: UUID, pinned: bool, actor_id: UUID
+    ) -> MemoryRecord: ...
+
     async def create_conversation(
         self, conversation: Conversation, event: AuditEvent
     ) -> Conversation: ...

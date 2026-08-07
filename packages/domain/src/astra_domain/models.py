@@ -101,6 +101,8 @@ class EventType(StrEnum):
     MEMORY_REJECTED = "memory.rejected"
     MEMORY_CONTRADICTION_RESOLVED = "memory.contradiction_resolved"
     MEMORY_DELETED = "memory.deleted"
+    MEMORY_PINNED = "memory.pinned"
+    MEMORY_UNPINNED = "memory.unpinned"
     TASK_CREATED = "task.created"
     ARA_REGISTERED = "ara.registered"
     TASK_LEASED = "task.leased"
@@ -405,6 +407,7 @@ class MemoryRecord(TenantOwnedModel):
     source_message_id: UUID
     confidence: float = Field(ge=0, le=1)
     confirmed: bool = False
+    pinned: bool = False
     state: MemoryState = MemoryState.CANDIDATE
     sensitivity: str = Field(default="normal", min_length=1, max_length=100)
     visibility: str = Field(default="private", min_length=1, max_length=100)

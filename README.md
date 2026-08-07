@@ -189,6 +189,18 @@ registered tenant's controller; retain audit logs and stop the process to revoke
 
 ## Memory
 
+### Controller Memory Tools
+
+The controller can use `get_fact(topic)` to recall only promoted private memories using the same
+tenant-authorized ranking path as context assembly. `set_fact(content)` runs the configured memory
+extractor and automatically promotes its extracted records; use it only for durable information.
+`search_session(query, limit)` performs bounded lexical search across conversations owned by the
+current user, never across another user's history. Each call is recorded as a tool invocation.
+
+Users can pin promoted memories through `POST /api/v1/memories/{memory_id}/pin`. Pinned facts are
+always injected before ranked recall in the controller context, subject to the configured context
+budget. Only promoted memories can be pinned.
+
 ### Hermes Holographic import
 
 Hermes imports are local, explicit, and read-only. The hosted API never accepts a filesystem path.

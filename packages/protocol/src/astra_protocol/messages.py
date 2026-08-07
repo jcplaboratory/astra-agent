@@ -184,6 +184,11 @@ class MemoryReviewRequest(Message):
     replaces_memory_id: UUID | None = None
 
 
+class MemoryPinRequest(Message):
+    tenant_id: UUID
+    pinned: bool
+
+
 class PersonaUpdateRequest(Message):
     tenant_id: UUID
     authored_core: PersonaCore

@@ -69,6 +69,7 @@ from astra_protocol import (
     LeaseResponse,
     MemoryExplanationResponse,
     MemoryListResponse,
+    MemoryPinRequest,
     MemoryReviewRequest,
     MigrationBatchResponse,
     MigrationPersonaRequest,
@@ -106,6 +107,7 @@ from astra_agent.auth import (
     trusted_mtls_ara_principal,
 )
 from astra_agent.conversations import ConversationOrchestrator
+from astra_agent.memory_tools import ControllerMemoryTools
 from astra_agent.settings import Settings
 from astra_agent.tools import LocalToolRegistry
 
@@ -354,6 +356,9 @@ def create_app(
         else:
             app.state.context_compiler = deterministic_compiler
         app.state.tool_registry = LocalToolRegistry(settings)
+        app.state.controller_memory_tools = ControllerMemoryTools(
+            app.state.store, app.state.memory_pipeline, deterministic_compiler
+        )
         app.state.orchestrator = ConversationOrchestrator(
             app.state.store,
             app.state.context_compiler,
@@ -365,6 +370,7 @@ def create_app(
             app.state.tool_registry,
             max_delegation_siblings=settings.delegation_max_siblings,
             audit=app.state.session_audit.record,
+            memory_tools=app.state.controller_memory_tools,
         )
         runner_tasks: dict[UUID, asyncio.Task[None]] = {}
 
@@ -1513,6 +1519,26 @@ def create_app(
                     )
                 )
         return reviewed
+
+    @api.post(
+        "/memories/{memory_id}/pin",
+        response_model=MemoryRecord,
+        tags=["memory"],
+    )
+    async def pin_memory(
+        memory_id: UUID,
+        body: MemoryPinRequest,
+        principal: Annotated[UserPrincipal, Depends(_user_principal)],
+        runtime_store: Annotated[RuntimeStore, Depends(_store)],
+    ) -> MemoryRecord:
+        if body.tenant_id != principal.tenant_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "tenant identity mismatch")
+        try:
+            return await runtime_store.pin_memory(
+                body.tenant_id, memory_id, body.pinned, principal.user_id
+            )
+        except (LifecycleNotFoundError, LifecycleConflictError) as error:
+            raise_lifecycle_error(error)
 
     @api.get("/tenants/{tenant_id}/tasks", response_model=list[Task], tags=["tasks"])
     async def list_tasks(
